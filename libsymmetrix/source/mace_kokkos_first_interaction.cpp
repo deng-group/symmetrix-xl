@@ -30,6 +30,10 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_m0_module.hpp"
+#include "metal_r0_module.hpp"
+#endif
 #include "device_backend.hpp"
 #include "mace_kokkos_jit_plugin_detail.hpp"
 #include "standard_m0.hpp"
@@ -657,6 +661,35 @@ void MACEKokkos<Precision>::compute_A0_streamed(
                 standard_r0_density_state);
             standard_r0_module_launch_count += 1;
         }
+#ifdef SYMMETRIX_ENABLE_METAL
+        if constexpr (std::is_same_v<Precision, float>) {
+            if (metal_r0_module && workspace_edge_begin == 0
+                    && Y.extent(0) >= r.extent(0)*A0.extent(1)) {
+                execution_space.fence();
+                metal_r0_module->forward(
+                symmetrix::execution::metal::MetalR0Graph{
+                    num_nodes, num_active_types, r_cut,
+                    node_types.data(), node_types.extent(0),
+                    num_neigh.data(), streamed_first_neigh.data(),
+                    neigh_types.data(), type_to_active.data(),
+                    type_to_active.extent(0), r.data(), r.extent(0)},
+                symmetrix::execution::metal::MetalR0Spline{
+                    R0_spline_h, R0_spline_min,
+                    R0_spline_coefficients.data(),
+                    R0_spline_coefficients.extent(0),
+                    R0_spline_coefficients.extent(1),
+                    R0_spline_coefficients.extent(3)},
+                    static_cast<std::int32_t>(A0.extent(2)),
+                    static_cast<std::int32_t>(A0.extent(1)),
+                    Y.data(),
+                    A0_scaled ? standard_r0_density_state.data() : nullptr,
+                    A0.data());
+                standard_r0_module_launch_count += 1;
+                standard_r0_density_scale_fused = A0_scaled;
+                return;
+            }
+        }
+#endif
         bool use_fused_r0_forward = false;
 #ifdef KOKKOS_ENABLE_HIP
         if constexpr (std::is_same_v<Precision,float>)
@@ -780,6 +813,150 @@ void MACEKokkos<Precision>::compute_A0_streamed(
             }
         });
     complete_device_stage("MACEKokkos::compute_A0_streamed");
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::metal_r0_reverse_admitted(
+    const int receiver_base,
+    const int edge_begin,
+    Kokkos::View<const double*> r) const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    const std::size_t harmonics = static_cast<std::size_t>(num_lm);
+    const bool gradients_available = Y_grad.data() != nullptr
+        ? Y_grad.extent(0) >= 3*r.extent(0)*harmonics
+        : num_lm == symmetrix::standard_r0::harmonic_count;
+    return metal_r0_module && receiver_base == 0 && edge_begin == 0
+        && !single_layer_tiled_plan_active && !dual_layer_tiled_plan_active
+        && Y.extent(0) >= r.extent(0)*harmonics && gradients_available;
+#else
+    (void)receiver_base;
+    (void)edge_begin;
+    (void)r;
+    return false;
+#endif
+}
+
+template <typename Precision>
+template <class ExecutionSpace, class CoordinateView>
+void MACEKokkos<Precision>::metal_r0_coordinate_reverse(
+    const ExecutionSpace& execution_space,
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_types,
+    const CoordinateView& coordinates,
+    const bool coordinates_are_unit,
+    Kokkos::View<const double*> r)
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>) {
+        const std::size_t edges = r.extent(0);
+        constexpr int harmonic_count = symmetrix::standard_r0::harmonic_count;
+        execution_space.fence();
+        const Precision* gradients = Y_grad.data();
+        if (gradients == nullptr) {
+            // The host owner recomputes l_max=3 gradients per edge; Metal
+            // receives the same values precomputed in [3, 16] edge blocks.
+            if (metal_r0_gradients.extent(0) < 3*harmonic_count*edges)
+                Kokkos::realloc(metal_r0_gradients, 3*harmonic_count*edges);
+            const auto out = metal_r0_gradients;
+            Kokkos::parallel_for(
+                "MetalR0::harmonic_gradients",
+                Kokkos::RangePolicy<ExecutionSpace,
+                    Kokkos::IndexType<std::size_t>>(execution_space, 0, edges),
+                KOKKOS_LAMBDA (const std::size_t edge) {
+                    const Precision direction[3] = {
+                        symmetrix::standard_r0::direction_component<Precision>(
+                            coordinates, r, edge, 0, coordinates_are_unit),
+                        symmetrix::standard_r0::direction_component<Precision>(
+                            coordinates, r, edge, 1, coordinates_are_unit),
+                        symmetrix::standard_r0::direction_component<Precision>(
+                            coordinates, r, edge, 2, coordinates_are_unit)};
+                    symmetrix::normalized_spherical_harmonic_gradients_from_direction<3>(
+                        direction, static_cast<Precision>(r(edge)),
+                        out.data()+3*harmonic_count*edge);
+                });
+            execution_space.fence();
+            gradients = metal_r0_gradients.data();
+        }
+        using CoordinateScalar = typename CoordinateView::non_const_value_type;
+        metal_r0_module->coordinate_reverse(
+            symmetrix::execution::metal::MetalR0Graph{
+                num_nodes, num_active_types, r_cut,
+                node_types.data(), node_types.extent(0),
+                num_neigh.data(), streamed_first_neigh.data(),
+                neigh_types.data(), type_to_active.data(),
+                type_to_active.extent(0), r.data(), edges},
+            symmetrix::execution::metal::MetalR0Spline{
+                R0_spline_h, R0_spline_min,
+                R0_spline_coefficients.data(),
+                R0_spline_coefficients.extent(0),
+                R0_spline_coefficients.extent(1),
+                R0_spline_coefficients.extent(3)},
+            static_cast<std::int32_t>(A0_adj.extent(2)),
+            static_cast<std::int32_t>(A0_adj.extent(1)),
+            coordinates.data(),
+            static_cast<std::uint32_t>(sizeof(CoordinateScalar)),
+            coordinates_are_unit,
+            Y.data(),
+            gradients,
+            A0_adj.data(),
+            node_forces.data());
+        if (A0_scaled) {
+            // Density-scale term of the standard owner, kept in FP64 on the
+            // host: one spline evaluation per active edge.
+            const auto density_scale = A0_splines;
+            const auto density_state = standard_r0_density_state;
+            const auto first_neigh = streamed_first_neigh;
+            const auto type_map = type_to_active;
+            const auto forces = node_forces;
+            const int active_type_count = num_active_types;
+            const double cutoff = r_cut;
+            Kokkos::parallel_for(
+                "MetalR0::density_scale_forces",
+                Kokkos::RangePolicy<ExecutionSpace>(execution_space, 0, num_nodes),
+                KOKKOS_LAMBDA (const int receiver) {
+                    const int receiver_type = type_map(node_types(receiver));
+                    const int edge_begin = first_neigh(receiver);
+                    const double density_factor = density_state(receiver);
+                    for (int local_edge=0; local_edge<num_neigh(receiver);
+                         ++local_edge) {
+                        const int edge = edge_begin+local_edge;
+                        if (!(r(edge) < cutoff))
+                            continue;
+                        const int neighbor_type = type_map(neigh_types(edge));
+                        const int density_edge_type =
+                            receiver_type <= neighbor_type
+                            ? receiver_type*(2*active_type_count-receiver_type-1)/2
+                                +neighbor_type
+                            : neighbor_type*(2*active_type_count-neighbor_type-1)/2
+                                +receiver_type;
+                        double density_value = 0.0;
+                        double density_derivative = 0.0;
+                        density_scale.evaluate_function(
+                            density_edge_type, r(edge), 0,
+                            density_value, density_derivative);
+                        const double contribution =
+                            density_factor*density_derivative;
+                        for (int k=0; k<3; ++k)
+                            forces(3*edge+k) += contribution
+                                *symmetrix::standard_r0::direction_component<Precision>(
+                                    coordinates, r, edge, k, coordinates_are_unit);
+                    }
+                });
+        }
+    }
+#else
+    (void)execution_space;
+    (void)num_nodes;
+    (void)node_types;
+    (void)num_neigh;
+    (void)neigh_types;
+    (void)coordinates;
+    (void)coordinates_are_unit;
+    (void)r;
+#endif
 }
 
 template <typename Precision>
@@ -953,6 +1130,18 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                 break;
             }
             default:
+#ifdef SYMMETRIX_ENABLE_METAL
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (metal_r0_reverse_admitted(
+                            receiver_base, edge_begin, r)) {
+                        metal_r0_coordinate_reverse(
+                            execution_space, num_nodes, node_types,
+                            num_neigh, neigh_types, coordinates,
+                            coordinates_are_unit, r);
+                        break;
+                    }
+                }
+#endif
                 symmetrix::standard_r0::launch_coordinate_reverse(
                     execution_space,
                     num_nodes,
@@ -1393,6 +1582,19 @@ void MACEKokkos<Precision>::compute_M0_module(
             if (!m0_host_plugin_ready())
                 throw std::runtime_error(
                     "Execution M0 host-plugin forward is unavailable.");
+#ifdef SYMMETRIX_ENABLE_METAL
+            if constexpr (std::is_same_v<Precision, float>) {
+                if (metal_m0_module) {
+                    execution_space.fence();
+                    metal_m0_module->forward(
+                        num_nodes, node_types.data(), A0.data(),
+                        standard_m0_module_weights.data(),
+                        standard_m0_module_weights.size(), M0.data());
+                    standard_m0_module_forward_launch_count += 1;
+                    return;
+                }
+            }
+#endif
             const SymmetrixJitM0HostArgsV1 args{
                 sizeof(SymmetrixJitM0HostArgsV1), 0u, num_nodes, num_channels, 0,
                 node_types.data(), A0.data(), standard_m0_module_weights.data(),
@@ -1484,6 +1686,23 @@ void MACEKokkos<Precision>::launch_M0_module_reverse(
             if (!m0_host_plugin_ready())
                 throw std::runtime_error(
                     "Execution M0 host-plugin reverse is unavailable.");
+#ifdef SYMMETRIX_ENABLE_METAL
+            bool metal_launched = false;
+            if constexpr (std::is_same_v<Precision, float>) {
+                if (metal_m0_module) {
+                    execution_space.fence();
+                    metal_m0_module->reverse(
+                        num_nodes, node_types.data(), input.data(),
+                        standard_m0_module_weights.data(),
+                        standard_m0_module_weights.size(),
+                        output_adjoint.data(), input_adjoint.data(),
+                        input_scale_adjoint.data(),
+                        capture_input_scale_adjoint);
+                    metal_launched = true;
+                }
+            }
+            if (!metal_launched) {
+#endif
             const SymmetrixJitM0HostArgsV1 args{
                 sizeof(SymmetrixJitM0HostArgsV1), 0u, num_nodes, num_channels,
                 capture_input_scale_adjoint ? 1 : 0,
@@ -1505,6 +1724,9 @@ void MACEKokkos<Precision>::launch_M0_module_reverse(
                     execution_space, 0,
                     static_cast<std::int64_t>(num_nodes)*owner_channel_tiles),
                 [=] (const std::int64_t index) { owner(&args, index); });
+#ifdef SYMMETRIX_ENABLE_METAL
+            }
+#endif
         } else {
             throw std::runtime_error(
                 "Execution M0 host plugins require host execution.");

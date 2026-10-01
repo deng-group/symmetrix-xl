@@ -41,6 +41,8 @@ struct LaunchProfile;
 }
 
 namespace symmetrix::execution::metal {
+class MetalM0Module;
+class MetalR0Module;
 class MetalR1Module;
 }
 
@@ -137,7 +139,30 @@ void load_metal_r1_module(
     int output_components);
 void clear_metal_r1_module();
 bool metal_r1_module_ready() const;
-std::map<std::string, double> metal_r1_statistics() const;
+// FP32 Metal execution of the standard R0 first interaction.
+void load_metal_r0_module();
+bool metal_r0_module_ready() const;
+// FP32 Metal execution of the generated M0 product basis.
+void load_metal_m0_module(
+    std::string source,
+    int channels,
+    int input_components,
+    int output_components,
+    int term_count);
+bool metal_m0_module_ready() const;
+bool metal_r0_reverse_admitted(
+    int receiver_base, int edge_begin, Kokkos::View<const double*> r) const;
+template <class ExecutionSpace, class CoordinateView>
+void metal_r0_coordinate_reverse(
+    const ExecutionSpace& execution_space,
+    int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_types,
+    const CoordinateView& coordinates,
+    bool coordinates_are_unit,
+    Kokkos::View<const double*> r);
+std::map<std::string, double> metal_statistics() const;
 std::string metal_r1_device_name() const;
 std::string jit_host_plugin_path() const;
 std::string jit_host_plugin_artifact_id() const;
@@ -1069,6 +1094,10 @@ std::unique_ptr<JitDevicePlugin> jit_device_plugin;
 #endif
 std::unique_ptr<symmetrix::execution::HostPlugin> jit_host_plugin;
 std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
+std::shared_ptr<symmetrix::execution::metal::MetalR0Module> metal_r0_module;
+std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m0_module;
+// Harmonic gradients recomputed for Metal R0 when Y_grad is not retained.
+Kokkos::View<Precision*> metal_r0_gradients;
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =

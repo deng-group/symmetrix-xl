@@ -5,12 +5,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <stdexcept>
-#include <vector>
 
 #include "metal_r1_abi.hpp"
 #include "metal_runtime.hpp"
+#include "metal_staging.hpp"
 
 namespace symmetrix::execution::metal {
 
@@ -56,79 +55,39 @@ struct MetalR1Module::Impl {
     MetalR1Shape shape;
     std::string device_name;
     MetalR1Statistics statistics;
-    std::map<std::string, Buffer> slots;
-
-    struct CachedSpline {
-        const void* host = nullptr;
-        std::size_t count = 0;
-        Buffer buffer;
-    };
-    std::vector<CachedSpline> splines;
-
-    Buffer& slot(const std::string& name, const std::size_t bytes)
-    {
-        Buffer& buffer = slots[name];
-        const std::size_t required = std::max<std::size_t>(bytes, 16);
-        if (!buffer || buffer.size() < required)
-            buffer = device.allocate(required);
-        return buffer;
-    }
+    std::unique_ptr<MetalStaging> staging;
 
     template <class T>
     Buffer& upload(const std::string& name, const T* values, const std::size_t count)
     {
-        Buffer& buffer = slot(name, count*sizeof(T));
-        if (count != 0) {
-            if (values == nullptr)
-                fail(name+" is null");
-            std::memcpy(buffer.contents(), values, count*sizeof(T));
-        }
-        return buffer;
+        return staging->upload(name, values, count);
     }
 
     Buffer& upload_narrowed(
         const std::string& name, const double* values, const std::size_t count)
     {
-        Buffer& buffer = slot(name, count*sizeof(float));
-        if (count != 0 && values == nullptr)
-            fail(name+" is null");
-        float* out = buffer.data<float>();
-        for (std::size_t i = 0; i < count; ++i)
-            out[i] = static_cast<float>(values[i]);
-        return buffer;
+        return staging->upload_narrowed(name, values, count);
+    }
+
+    Buffer& slot(const std::string& name, const std::size_t bytes)
+    {
+        return staging->slot(name, bytes);
     }
 
     Buffer& zeroed(const std::string& name, const std::size_t count)
     {
-        Buffer& buffer = slot(name, count*sizeof(float));
-        std::memset(buffer.contents(), 0, std::max<std::size_t>(count, 1)*sizeof(float));
-        return buffer;
+        return staging->zeroed(name, count);
     }
 
-    // The evaluator keeps spline views alive for the model lifetime, so the
-    // host pointer and extent identify an uploaded coefficient table.
+    // The evaluator keeps spline views alive for the model lifetime.
     MetalR1RadialSpline spline(
         const SymmetrixJitHostRadialSplineV2& radial, CommandBatch& batch)
     {
         const std::size_t count = static_cast<std::size_t>(radial.edge_types)
             *radial.intervals*4u*radial.functions;
-        auto cached = std::find_if(splines.begin(), splines.end(),
-            [&](const CachedSpline& entry) {
-                return entry.host == radial.coefficients && entry.count == count;
-            });
-        if (cached == splines.end()) {
-            if (radial.coefficients == nullptr || count == 0)
-                fail("radial spline coefficients are empty");
-            CachedSpline entry;
-            entry.host = radial.coefficients;
-            entry.count = count;
-            entry.buffer = device.allocate(count*sizeof(float));
-            std::memcpy(entry.buffer.contents(), radial.coefficients,
-                count*sizeof(float));
-            splines.push_back(std::move(entry));
-            cached = std::prev(splines.end());
-        }
-        batch.use_buffer(cached->buffer, false);
+        const Buffer& coefficients =
+            staging->persistent(radial.coefficients, count*sizeof(float));
+        batch.use_buffer(coefficients, false);
         return {
             radial.edge_types,
             radial.intervals,
@@ -136,7 +95,7 @@ struct MetalR1Module::Impl {
             static_cast<float>(radial.h),
             static_cast<float>(radial.x0),
             0,
-            cached->buffer.gpu_address()};
+            coefficients.gpu_address()};
     }
 };
 
@@ -150,6 +109,7 @@ MetalR1Module::MetalR1Module(
     impl_->shape = shape;
     impl_->device = Device::system_default();
     impl_->device_name = impl_->device.information().device_name;
+    impl_->staging = std::make_unique<MetalStaging>(impl_->device, "R1");
     const Library library = impl_->device.compile(msl_source);
     impl_->forward = impl_->device.pipeline(library, "symmetrix_r1_forward");
     impl_->source = impl_->device.pipeline(library, "symmetrix_r1_source");

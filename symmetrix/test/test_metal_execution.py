@@ -8,12 +8,23 @@ import numpy as np
 import pytest
 from ase.spacegroup import crystal
 
-from symmetrix.metal_codegen import metal_r1_metadata, render_jit_r1_metal_source
+from symmetrix.metal_codegen import (
+    metal_m0_metadata,
+    metal_r1_metadata,
+    render_jit_m0_metal_source,
+    render_jit_r1_metal_source,
+)
 
 FIXTURE_CONTRACT = (
     Path(__file__).resolve().parent
     / "data"
     / "jit_r1_fixture_c4_e3_l0_contract.json.in"
+)
+M0_CONTRACT = (
+    Path(__file__).resolve().parent
+    / "data"
+    / "execution_contracts"
+    / "standard_m0_contract.json"
 )
 OMAT_CONTRACT = (
     Path(__file__).resolve().parent
@@ -36,6 +47,18 @@ def test_metal_r1_source_is_fp32_msl_with_three_kernels(contract_path):
     assert not re.search(r"\bdouble\b|\bstd::|\bnullptr\b|if constexpr", source)
     assert "simd_sum(local_force_x)" in source
     assert "channel += 32" in source
+
+
+def test_metal_m0_source_covers_every_term():
+    contract = json.loads(M0_CONTRACT.read_text())
+    metadata = metal_m0_metadata(contract)
+    source = render_jit_m0_metal_source(contract)
+
+    assert source.count("out[") - 2 >= metadata["term_count"]
+    assert "kernel void symmetrix_m0_forward(" in source
+    assert "kernel void symmetrix_m0_reverse(" in source
+    assert "simd_sum(scale)" in source
+    assert not re.search(r"\bdouble\b|\bstd::", source)
 
 
 def test_metal_r1_metadata_matches_host_plugin_shape():
@@ -113,7 +136,7 @@ def _evaluate(atoms, calc):
     return atoms.get_potential_energy(), atoms.get_forces(), atoms.get_stress()
 
 
-def test_metal_r1_matches_host_fp32_and_runs_on_gpu(omat_small_model):
+def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     from symmetrix import Symmetrix
 
     species = [8, 22, 38]
@@ -130,6 +153,11 @@ def test_metal_r1_matches_host_fp32_and_runs_on_gpu(omat_small_model):
     assert statistics["forward_launches"] >= 1
     assert statistics["reverse_launches"] >= 1
     assert statistics["gpu_seconds"] > 0.0
+    assert statistics["r0_forward_launches"] >= 1
+    assert statistics["r0_reverse_launches"] >= 1
+    assert statistics["r0_gpu_seconds"] > 0.0
+    assert statistics["m0_forward_launches"] >= 1
+    assert statistics["m0_reverse_launches"] >= 1
     assert host.metal_status == "disabled"
     # FP32 summation order differs between the host owners and the GPU.
     assert abs(e_metal - e_host) / len(atoms) < 1e-5

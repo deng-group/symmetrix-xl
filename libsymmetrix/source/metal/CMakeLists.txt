@@ -17,7 +17,8 @@ endif()
 
 option(SYMMETRIX_METAL_SELFTEST "Build the Metal runtime self-test executable." ON)
 
-add_library(symmetrix_metal STATIC metal_runtime.mm metal_r1_module.cpp)
+add_library(symmetrix_metal STATIC
+    metal_runtime.mm metal_m0_module.cpp metal_r0_module.cpp metal_r1_module.cpp)
 set_target_properties(symmetrix_metal PROPERTIES
     OBJCXX_STANDARD 20
     OBJCXX_STANDARD_REQUIRED ON

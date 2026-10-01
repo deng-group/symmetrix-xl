@@ -1820,7 +1820,7 @@ class Symmetrix(Calculator):
         self.jit_diagnostics = (*self.jit_diagnostics, *diagnostics)
 
     def _configure_metal_r1(self, model_data):
-        """Move the R1 owners of a loaded FP32 host plugin onto the Metal GPU."""
+        """Move R1, the standard R0 first interaction, and M0 onto the Metal GPU."""
 
         from .metal_codegen import metal_r1_metadata, render_jit_r1_metal_source
 
@@ -1840,13 +1840,29 @@ class Symmetrix(Calculator):
         )
         if not self.evaluator._metal_r1_module_ready():
             raise RuntimeError("the evaluator did not retain the Metal R1 module")
+        load_r0 = getattr(self.evaluator, "_load_metal_r0_module", None)
+        if load_r0 is not None:
+            load_r0()
+        m0_contract = model_data.get("execution_contracts", {}).get("M0")
+        load_m0 = getattr(self.evaluator, "_load_metal_m0_module", None)
+        if m0_contract and load_m0 is not None:
+            from .metal_codegen import metal_m0_metadata, render_jit_m0_metal_source
+
+            m0 = metal_m0_metadata(m0_contract)
+            load_m0(
+                render_jit_m0_metal_source(m0_contract),
+                m0["channels"],
+                m0["input_components"],
+                m0["output_components"],
+                m0["term_count"],
+            )
         self.metal_status = "ready"
         self.metal_device = self.evaluator._metal_r1_device_name()
 
     def metal_statistics(self):
-        """Return Metal R1 launch counts and GPU/staging seconds."""
+        """Return Metal R0/R1 launch counts and GPU/staging seconds."""
 
-        query = getattr(self.evaluator, "_metal_r1_statistics", None)
+        query = getattr(self.evaluator, "_metal_statistics", None)
         return dict(query()) if callable(query) else {}
 
     def _configure_jit(
