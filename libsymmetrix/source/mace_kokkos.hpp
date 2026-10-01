@@ -150,6 +150,9 @@ void load_metal_m0_module(
     int output_components,
     int term_count);
 bool metal_m0_module_ready() const;
+// Fills the per-degree A1 layout consumed by the Metal R1 module; returns
+// false when the model's A1 blocks fall outside its supported shape.
+bool metal_a1_layout(void* layout) const;
 bool metal_r0_reverse_admitted(
     int receiver_base, int edge_begin, Kokkos::View<const double*> r) const;
 template <class ExecutionSpace, class CoordinateView>

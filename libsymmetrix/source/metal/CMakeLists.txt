@@ -29,6 +29,7 @@ target_include_directories(symmetrix_metal
            "${CMAKE_CURRENT_SOURCE_DIR}/../../../symmetrix/source/symmetrix")
 target_link_libraries(symmetrix_metal PUBLIC
     "-framework Metal"
+    "-framework MetalPerformanceShaders"
     "-framework Foundation")
 target_compile_definitions(symmetrix_metal PUBLIC SYMMETRIX_ENABLE_METAL)
 

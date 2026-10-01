@@ -278,6 +278,66 @@ int main()
             "kernel dereferences device pointers embedded in a packet");
     }
 
+    // Strided MPS GEMM followed by a compute dispatch in the same batch.
+    {
+        const std::uint32_t rows = 37, inner = 70, columns = 50;
+        const std::uint32_t left_stride = 96, result_stride = 64;
+        const std::size_t left_offset = 5, result_offset = 3;
+        const mtl::Buffer left = device.allocate(
+            (left_offset+rows*left_stride)*sizeof(float));
+        const mtl::Buffer right = device.allocate(inner*columns*sizeof(float));
+        const mtl::Buffer result = device.allocate(
+            (result_offset+rows*result_stride)*sizeof(float));
+        const mtl::Buffer transposed = device.allocate(inner*rows*sizeof(float));
+        for (std::size_t i = 0; i < left.size()/sizeof(float); ++i)
+            left.data<float>()[i] = std::sin(0.37f*static_cast<float>(i));
+        for (std::size_t i = 0; i < inner*columns; ++i)
+            right.data<float>()[i] = std::cos(0.11f*static_cast<float>(i));
+        const mtl::Buffer probe_out = device.allocate(sizeof(std::uint32_t));
+        auto batch = device.begin();
+        batch.use_buffer(probe_out, true);
+        batch.gemm(
+            {&left, left_offset*sizeof(float), rows, inner, left_stride*sizeof(float)},
+            {&right, 0, inner, columns, columns*sizeof(float)},
+            {&result, result_offset*sizeof(float), rows, columns,
+                result_stride*sizeof(float)});
+        // left^T written densely: [inner, rows] = op(left)^T via identity right.
+        const mtl::Buffer identity = device.allocate(rows*rows*sizeof(float));
+        for (std::uint32_t i = 0; i < rows; ++i)
+            identity.data<float>()[i*rows+i] = 1.0f;
+        batch.gemm(
+            {&left, left_offset*sizeof(float), rows, inner, left_stride*sizeof(float)},
+            {&identity, 0, rows, rows, rows*sizeof(float)},
+            {&transposed, 0, inner, rows, rows*sizeof(float)}, true, false);
+        batch.set_buffer(0, probe_out).dispatch_threads(probe, {1}, {1});
+        batch.submit_and_wait();
+        float worst = 0.0f;
+        for (std::uint32_t i = 0; i < rows; ++i)
+            for (std::uint32_t j = 0; j < columns; ++j) {
+                double expected = 0.0;
+                for (std::uint32_t k = 0; k < inner; ++k)
+                    expected += static_cast<double>(
+                        left.data<float>()[left_offset+i*left_stride+k])
+                        *right.data<float>()[k*columns+j];
+                const float actual =
+                    result.data<float>()[result_offset+i*result_stride+j];
+                worst = std::max(worst, static_cast<float>(
+                    std::fabs(expected-actual)/std::max(1.0, std::fabs(expected))));
+            }
+        bool transposed_exact = true;
+        for (std::uint32_t k = 0; k < inner; ++k)
+            for (std::uint32_t i = 0; i < rows; ++i)
+                transposed_exact = transposed_exact
+                    && transposed.data<float>()[k*rows+i]
+                        == left.data<float>()[left_offset+i*left_stride+k];
+        check(worst < 1e-5f,
+            "strided MPS GEMM matches FP64 reference, relative error "
+            +std::to_string(worst));
+        check(transposed_exact, "transposed MPS GEMM operand is exact");
+        check(*probe_out.data<std::uint32_t>() == 32,
+            "compute dispatch after GEMM reopens its encoder");
+    }
+
     // Error reporting.
     check(throws([&] { device.compile("kernel void broken( {"); }),
         "MSL compile errors throw");

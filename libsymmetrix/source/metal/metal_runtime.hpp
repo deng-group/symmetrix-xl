@@ -67,6 +67,17 @@ struct BatchTiming {
 
 class Device;
 class CommandBatch;
+class Buffer;
+
+// A row-major FP32 matrix inside a buffer, addressed with an explicit row
+// stride so strided sub-blocks of evaluator tensors need no packing.
+struct MatrixView {
+    const Buffer* buffer = nullptr;
+    std::size_t offset_bytes = 0;
+    std::uint32_t rows = 0;
+    std::uint32_t columns = 0;
+    std::size_t row_bytes = 0;
+};
 
 class Buffer {
 public:
@@ -150,6 +161,14 @@ public:
     // Makes a buffer reached through an embedded GPU address resident for
     // the dispatches that follow.
     CommandBatch& use_buffer(const Buffer& buffer, bool written);
+
+    // result = alpha*op(left)*op(right) + beta*result with Metal Performance
+    // Shaders. The GEMM runs between compute encoders, so argument bindings
+    // set before it do not carry over; buffer residency does.
+    CommandBatch& gemm(
+        const MatrixView& left, const MatrixView& right, const MatrixView& result,
+        bool transpose_left = false, bool transpose_right = false,
+        double alpha = 1.0, double beta = 0.0);
 
     // Grid in threads; edge threadgroups may be partial.
     CommandBatch& dispatch_threads(

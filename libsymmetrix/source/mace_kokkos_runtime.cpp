@@ -1503,6 +1503,13 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["forward_seconds"] = statistics.forward_seconds;
         values["source_seconds"] = statistics.source_seconds;
         values["edge_seconds"] = statistics.edge_seconds;
+        values["a1_forward_launches"] =
+            static_cast<double>(statistics.a1_forward_launches);
+        values["a1_reverse_launches"] =
+            static_cast<double>(statistics.a1_reverse_launches);
+        values["resident_uploads_skipped"] =
+            static_cast<double>(statistics.resident_uploads_skipped);
+        values["a1_seconds"] = statistics.a1_seconds;
     }
 #endif
     return values;

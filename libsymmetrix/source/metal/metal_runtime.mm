@@ -2,11 +2,13 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <unistd.h>
 
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #if !__has_feature(objc_arc)
 #error "metal_runtime.mm must be compiled with -fobjc-arc"
@@ -104,11 +106,27 @@ struct CommandBatch::Impl {
     std::uint64_t dispatch_count = 0;
     bool committed = false;
     bool waited = false;
+    // Residency declared with use_buffer; replayed on encoders opened after
+    // an MPS GEMM so later dispatches still see indirectly used buffers.
+    std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>> resident;
 
-    void require_encoding() const
+    // Opens a compute encoder on demand, e.g. after a GEMM closed one.
+    void require_encoding()
     {
-        if (encoder == nil)
+        if (committed)
             fail("command batch is no longer encoding");
+        if (encoder != nil)
+            return;
+        encoder = [command_buffer
+            computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        if (encoder == nil)
+            fail("could not reopen a compute command encoder");
+        for (const auto& [buffer, usage] : resident)
+            [encoder useResource:buffer usage:usage];
+        for (std::uint32_t index = 0; index < argument_table_entries; ++index)
+            if (threadgroup_memory[index] != 0)
+                [encoder setThreadgroupMemoryLength:threadgroup_memory[index]
+                                            atIndex:index];
     }
 
     std::size_t dynamic_threadgroup_bytes() const
@@ -283,6 +301,74 @@ CommandBatch& CommandBatch::use_buffer(const Buffer& buffer, const bool written)
         ? (MTLResourceUsageRead | MTLResourceUsageWrite)
         : MTLResourceUsageRead;
     [impl_->encoder useResource:buffer.impl_->buffer usage:usage];
+    impl_->resident.emplace_back(buffer.impl_->buffer, usage);
+    return *this;
+}
+
+namespace {
+
+void validate_matrix(const MatrixView& view, const char* role)
+{
+    if (view.buffer == nullptr || !*view.buffer)
+        fail(std::string("GEMM ")+role+" matrix has no buffer");
+    if (view.rows == 0 || view.columns == 0)
+        fail(std::string("GEMM ")+role+" matrix is empty");
+    if (view.row_bytes % sizeof(float) != 0 || view.offset_bytes % sizeof(float) != 0
+            || view.row_bytes < view.columns*sizeof(float))
+        fail(std::string("GEMM ")+role+" matrix stride or offset is invalid");
+    const std::size_t extent = view.offset_bytes
+        +(static_cast<std::size_t>(view.rows)-1)*view.row_bytes
+        +view.columns*sizeof(float);
+    if (extent > view.buffer->size())
+        fail(std::string("GEMM ")+role+" matrix exceeds its buffer");
+}
+
+}  // namespace
+
+CommandBatch& CommandBatch::gemm(
+    const MatrixView& left, const MatrixView& right, const MatrixView& result,
+    const bool transpose_left, const bool transpose_right,
+    const double alpha, const double beta)
+{
+    if (!impl_ || impl_->committed)
+        fail("gemm requires an encoding command batch");
+    validate_matrix(left, "left");
+    validate_matrix(right, "right");
+    validate_matrix(result, "result");
+    const std::uint32_t rows = transpose_left ? left.columns : left.rows;
+    const std::uint32_t interior = transpose_left ? left.rows : left.columns;
+    const std::uint32_t right_interior = transpose_right ? right.columns : right.rows;
+    const std::uint32_t columns = transpose_right ? right.rows : right.columns;
+    if (interior != right_interior || result.rows != rows || result.columns != columns)
+        fail("GEMM matrix shapes do not conform");
+    impl_->end_encoding();
+    @autoreleasepool {
+        id<MTLDevice> device = impl_->command_buffer.device;
+        auto matrix = [](const MatrixView& view) {
+            MPSMatrixDescriptor* descriptor =
+                [MPSMatrixDescriptor matrixDescriptorWithRows:view.rows
+                                                      columns:view.columns
+                                                     rowBytes:view.row_bytes
+                                                     dataType:MPSDataTypeFloat32];
+            return [[MPSMatrix alloc] initWithBuffer:view.buffer->impl_->buffer
+                                              offset:view.offset_bytes
+                                          descriptor:descriptor];
+        };
+        MPSMatrixMultiplication* kernel = [[MPSMatrixMultiplication alloc]
+            initWithDevice:device
+             transposeLeft:transpose_left
+            transposeRight:transpose_right
+                resultRows:rows
+             resultColumns:columns
+           interiorColumns:interior
+                     alpha:alpha
+                      beta:beta];
+        [kernel encodeToCommandBuffer:impl_->command_buffer
+                           leftMatrix:matrix(left)
+                          rightMatrix:matrix(right)
+                         resultMatrix:matrix(result)];
+    }
+    ++impl_->dispatch_count;
     return *this;
 }
 

@@ -45,6 +45,7 @@ std::uint32_t checked_u32(const std::int64_t value, const char* field)
     return static_cast<std::uint32_t>(value);
 }
 
+
 }  // namespace
 
 struct MetalR1Module::Impl {
@@ -56,6 +57,25 @@ struct MetalR1Module::Impl {
     std::string device_name;
     MetalR1Statistics statistics;
     std::unique_ptr<MetalStaging> staging;
+
+    // GPU buffers whose contents equal a host view written by the last call.
+    struct Resident {
+        const void* host = nullptr;
+        std::size_t count = 0;
+
+        bool matches(const void* pointer, const std::size_t elements) const
+        {
+            return host != nullptr && host == pointer && count == elements;
+        }
+    };
+    Resident phi1;
+    Resident phi1_adjoint;
+
+    static void validate(const MetalA1Layout& layout, MetalStaging& staging)
+    {
+        if (layout.l_max < 0 || layout.l_max > 3)
+            staging.fail("A1 supports l_max from 0 through 3");
+    }
 
     template <class T>
     Buffer& upload(const std::string& name, const T* values, const std::size_t count)
@@ -146,6 +166,7 @@ void MetalR1Module::forward(
         fail("forward packet size does not match");
     auto& m = *impl_;
     const MetalR1Shape& s = m.shape;
+    m.phi1 = {};
     const std::size_t nodes = checked_u32(args.num_nodes, "num_nodes");
     const std::size_t edges = checked_u32(args.num_edges, "num_edges");
     if (nodes == 0)
@@ -200,6 +221,7 @@ void MetalR1Module::forward(
     m.statistics.forward_seconds += forward_seconds;
     const auto readback = Clock::now();
     std::memcpy(args.output, output.contents(), output_count*sizeof(float));
+    m.phi1 = {args.output, output_count};
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.forward_launches;
 }
@@ -238,9 +260,19 @@ void MetalR1Module::reverse(
     Buffer& radius = m.upload_narrowed("radius", source.radius, edges);
     Buffer& harmonics = m.upload("harmonics_values",
         static_cast<const float*>(source.harmonics_values), edges*s.edge_harmonics);
-    Buffer& output_adjoint = m.upload("output_adjoint",
-        static_cast<const float*>(source.output_adjoint),
-        extents.receivers*s.output_components*channels);
+    const std::size_t adjoint_elements =
+        extents.receivers*s.output_components*channels;
+    Buffer* output_adjoint_buffer = nullptr;
+    if (m.phi1_adjoint.matches(source.output_adjoint, adjoint_elements)) {
+        output_adjoint_buffer = &m.slot("output_adjoint", adjoint_elements*sizeof(float));
+        ++m.statistics.resident_uploads_skipped;
+    } else {
+        output_adjoint_buffer = &m.upload("output_adjoint",
+            static_cast<const float*>(source.output_adjoint), adjoint_elements);
+    }
+    m.phi1_adjoint = {};
+    m.phi1 = {};
+    Buffer& output_adjoint = *output_adjoint_buffer;
     Buffer& features = m.upload("neighbor_features",
         static_cast<const float*>(edge.neighbor_features),
         extents.neighbor_feature_nodes*s.source_harmonics*channels);
@@ -347,6 +379,109 @@ void MetalR1Module::reverse(
         edge.directed_forces[i] += static_cast<double>(force_values[i]);
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.reverse_launches;
+}
+
+// For degree l and row m, the Phi1 rows of all nodes form a strided matrix
+// with one row per node, so A1 is 2l+1 GEMMs per degree over every node.
+bool MetalR1Module::a1_forward(
+    const float* phi1, const std::size_t num_nodes,
+    const MetalA1Layout& layout, float* a1)
+{
+    auto& m = *impl_;
+    Impl::validate(layout, *m.staging);
+    const std::size_t channels = static_cast<std::size_t>(m.shape.channels);
+    const std::size_t phi1_count = num_nodes*layout.num_lme*channels;
+    if (num_nodes == 0 || !m.phi1.matches(phi1, phi1_count))
+        return false;
+    checked_u32(static_cast<std::int64_t>(num_nodes), "A1 node count");
+    const auto rows = static_cast<std::uint32_t>(num_nodes);
+    const auto c = static_cast<std::uint32_t>(channels);
+    auto batch = m.device.begin();
+    Buffer& input = m.slot("forward_output", phi1_count*sizeof(float));
+    const std::size_t output_count = num_nodes*layout.num_lm*channels;
+    Buffer& output = m.slot("a1_output", output_count*sizeof(float));
+    const std::size_t input_row = layout.num_lme*channels*sizeof(float);
+    const std::size_t output_row = layout.num_lm*channels*sizeof(float);
+    for (int l = 0; l <= layout.l_max; ++l) {
+        const auto inputs = static_cast<std::uint32_t>(layout.eta[l]*channels);
+        if (inputs == 0)
+            continue;
+        const Buffer& weights = m.staging->persistent(
+            layout.weights[l], static_cast<std::size_t>(inputs)*channels*sizeof(float));
+        for (int row = 0; row < 2*l+1; ++row)
+            batch.gemm(
+                {&input, (layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
+                    *sizeof(float), rows, inputs, input_row},
+                {&weights, 0, inputs, c, channels*sizeof(float)},
+                {&output, (static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
+                    rows, c, output_row});
+    }
+    const double a1_seconds = batch.submit_and_wait().gpu_seconds;
+    m.statistics.gpu_seconds += a1_seconds;
+    m.statistics.a1_seconds += a1_seconds;
+    const auto readback = Clock::now();
+    std::memcpy(a1, output.contents(), output_count*sizeof(float));
+    // Degrees without paths contribute zero rows, as the zero-depth host GEMM.
+    for (int l = 0; l <= layout.l_max; ++l)
+        if (layout.eta[l] == 0)
+            for (std::size_t node = 0; node < num_nodes; ++node)
+                std::memset(a1+(node*layout.num_lm+l*l)*channels, 0,
+                    (2*l+1)*channels*sizeof(float));
+    m.statistics.staging_seconds += seconds_since(readback);
+    ++m.statistics.a1_forward_launches;
+    return true;
+}
+
+void MetalR1Module::a1_reverse(
+    const std::size_t num_nodes, const std::size_t capacity_nodes,
+    const MetalA1Layout& layout,
+    const float* a1_adjoint, float* phi1_adjoint)
+{
+    auto& m = *impl_;
+    Impl::validate(layout, *m.staging);
+    if (num_nodes == 0)
+        return;
+    if (capacity_nodes < num_nodes)
+        m.staging->fail("dPhi1 capacity is smaller than the node count");
+    checked_u32(static_cast<std::int64_t>(num_nodes), "A1 node count");
+    const std::size_t channels = static_cast<std::size_t>(m.shape.channels);
+    const auto rows = static_cast<std::uint32_t>(num_nodes);
+    const auto c = static_cast<std::uint32_t>(channels);
+    const auto staging = Clock::now();
+    auto batch = m.device.begin();
+    Buffer& input = m.upload("a1_adjoint", a1_adjoint,
+        num_nodes*layout.num_lm*channels);
+    const std::size_t output_count = num_nodes*layout.num_lme*channels;
+    const std::size_t capacity_count = capacity_nodes*layout.num_lme*channels;
+    // Written into the R1 reverse input slot, sized as the reverse stages
+    // it, so the next reverse reuses it without a reallocation.
+    Buffer& output = m.slot("output_adjoint", capacity_count*sizeof(float));
+    const std::size_t input_row = layout.num_lm*channels*sizeof(float);
+    const std::size_t output_row = layout.num_lme*channels*sizeof(float);
+    for (int l = 0; l <= layout.l_max; ++l) {
+        const auto inputs = static_cast<std::uint32_t>(layout.eta[l]*channels);
+        if (inputs == 0)
+            continue;
+        const Buffer& weights_trans = m.staging->persistent(
+            layout.weights_trans[l],
+            static_cast<std::size_t>(inputs)*channels*sizeof(float));
+        for (int row = 0; row < 2*l+1; ++row)
+            batch.gemm(
+                {&input, (static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
+                    rows, c, input_row},
+                {&weights_trans, 0, c, inputs, inputs*sizeof(float)},
+                {&output, (layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
+                    *sizeof(float), rows, inputs, output_row});
+    }
+    m.statistics.staging_seconds += seconds_since(staging);
+    const double a1_seconds = batch.submit_and_wait().gpu_seconds;
+    m.statistics.gpu_seconds += a1_seconds;
+    m.statistics.a1_seconds += a1_seconds;
+    const auto readback = Clock::now();
+    std::memcpy(phi1_adjoint, output.contents(), output_count*sizeof(float));
+    m.phi1_adjoint = {phi1_adjoint, capacity_count};
+    m.statistics.staging_seconds += seconds_since(readback);
+    ++m.statistics.a1_reverse_launches;
 }
 
 }  // namespace symmetrix::execution::metal

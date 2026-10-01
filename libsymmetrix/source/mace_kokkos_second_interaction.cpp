@@ -30,6 +30,9 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_r1_module.hpp"
+#endif
 #include "cblas.hpp"
 #include "device_backend.hpp"
 #include "factorized_blas.hpp"
@@ -63,6 +66,20 @@ void MACEKokkos<Precision>::compute_A1(
     // The core matrix multiplication is:
     //         [A1_il]_mk = \sum_(ek') [Phi1_il]_m(ek') [W_il]_(ek')k
     ensure_mh0_a1_forward_capacity(num_nodes);
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>) {
+        symmetrix::execution::metal::MetalA1Layout layout;
+        if (metal_r1_module && metal_a1_layout(&layout)
+                && A1.extent(0) >= static_cast<std::size_t>(num_nodes)
+                && A1.span_is_contiguous() && Phi1.span_is_contiguous()) {
+            factorized_execution_space.fence();
+            if (metal_r1_module->a1_forward(
+                    Phi1.data(), static_cast<std::size_t>(num_nodes),
+                    layout, A1.data()))
+                return;
+        }
+    }
+#endif
 
     const auto l_max = this->l_max;
     const auto num_channels = this->num_channels;
@@ -291,6 +308,57 @@ void MACEKokkos<Precision>::reverse_A1_channel_tile(
 }
 
 template <typename Precision>
+bool MACEKokkos<Precision>::metal_a1_layout(void* destination) const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (!std::is_same_v<Precision, float>) {
+        (void)destination;
+        return false;
+    } else {
+    auto& layout =
+        *static_cast<symmetrix::execution::metal::MetalA1Layout*>(destination);
+    if (l_max < 0 || l_max > 3 || A1_weights.extent_int(0) < l_max+1
+            || A1_weights_trans.extent_int(0) < l_max+1
+            || Phi1.extent_int(1) != num_lme)
+        return false;
+    layout = {};
+    layout.l_max = l_max;
+    layout.num_lme = num_lme;
+    layout.num_lm = num_lm;
+    int rows = 0;
+    for (int l=0; l<=l_max; ++l) {
+        for (std::size_t p=0; p<Phi1_l.extent(0); ++p) {
+            if (Phi1_l(p) < l)
+                layout.lme[l] += 2*Phi1_l(p)+1;
+            if (Phi1_l(p) == l)
+                ++layout.eta[l];
+        }
+        rows += (2*l+1)*layout.eta[l];
+        const std::size_t inputs =
+            static_cast<std::size_t>(layout.eta[l])*num_channels;
+        if (inputs == 0)
+            continue;
+        const auto& weights = A1_weights(l);
+        const auto& weights_trans = A1_weights_trans(l);
+        if (weights.extent(0) != inputs
+                || weights.extent_int(1) != num_channels
+                || weights_trans.extent_int(0) != num_channels
+                || weights_trans.extent(1) != inputs
+                || !weights.span_is_contiguous()
+                || !weights_trans.span_is_contiguous())
+            return false;
+        layout.weights[l] = weights.data();
+        layout.weights_trans[l] = weights_trans.data();
+    }
+    return rows == num_lme;
+    }
+#else
+    (void)destination;
+    return false;
+#endif
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::reverse_A1_from(
     int num_nodes,
     Kokkos::View<const Precision***,Kokkos::LayoutRight> output_adjoint,
@@ -307,6 +375,21 @@ void MACEKokkos<Precision>::reverse_A1_from(
         || dPhi1.extent_int(2) != num_channels)
         Kokkos::realloc(dPhi1, num_nodes, num_lme, num_channels);
 
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>) {
+        symmetrix::execution::metal::MetalA1Layout layout;
+        if (metal_r1_module && metal_a1_layout(&layout)
+                && output_adjoint.span_is_contiguous()
+                && output_adjoint.extent_int(1) == num_lm
+                && dPhi1.span_is_contiguous()) {
+            factorized_execution_space.fence();
+            metal_r1_module->a1_reverse(
+                static_cast<std::size_t>(num_nodes), dPhi1.extent(0), layout,
+                output_adjoint.data(), dPhi1.data());
+            return;
+        }
+    }
+#endif
     const auto l_max = this->l_max;
     const auto num_channels = this->num_channels;
     const auto Phi1_l = this->Phi1_l;
