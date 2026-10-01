@@ -164,6 +164,15 @@ bool Buffer::owns_storage() const
     return impl_ && impl_->owns_storage;
 }
 
+std::uint64_t Buffer::gpu_address() const
+{
+    if (!impl_)
+        return 0;
+    if (@available(macOS 13.0, *))
+        return impl_->buffer.gpuAddress;
+    fail("embedded GPU addresses require macOS 13 or newer");
+}
+
 // ----- Library -----
 
 std::string Library::compile_log() const
@@ -260,6 +269,20 @@ CommandBatch& CommandBatch::set_threadgroup_memory(
     const std::size_t rounded = (bytes+15) & ~static_cast<std::size_t>(15);
     impl_->threadgroup_memory[index] = rounded;
     [impl_->encoder setThreadgroupMemoryLength:rounded atIndex:index];
+    return *this;
+}
+
+CommandBatch& CommandBatch::use_buffer(const Buffer& buffer, const bool written)
+{
+    if (!impl_)
+        fail("use_buffer on an empty command batch");
+    impl_->require_encoding();
+    if (!buffer)
+        fail("use_buffer received an empty buffer");
+    const MTLResourceUsage usage = written
+        ? (MTLResourceUsageRead | MTLResourceUsageWrite)
+        : MTLResourceUsageRead;
+    [impl_->encoder useResource:buffer.impl_->buffer usage:usage];
     return *this;
 }
 

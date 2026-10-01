@@ -748,8 +748,14 @@ class Symmetrix(Calculator):
         dispersion_xc="pbe",
         dispersion_cutoff=None,
         dispersion_device=None,
+        metal=False,
         **kwargs,
     ):
+        self.metal_request = bool(metal)
+        self.metal_status = "disabled"
+        self.metal_device = None
+        if self.metal_request and dtype != "float32":
+            raise ValueError("metal=True requires dtype='float32'; Metal has no FP64")
         self.dispersion = bool(dispersion)
         self._dispersion_calculator = None
         self._dispersion_properties = ()
@@ -1159,6 +1165,11 @@ class Symmetrix(Calculator):
             use_kokkos=use_kokkos,
             streamed_edges=self.streamed_edges,
         )
+        if self.metal_request and self.metal_status != "ready":
+            raise RuntimeError(
+                "metal=True requires generated direct R1 execution on a host "
+                f"backend; JIT status is {self.jit_status!r}"
+            )
         if (
             self._native_execution_plan_available
             and self.execution_profile in _EXECUTION_PROFILES
@@ -1808,6 +1819,36 @@ class Symmetrix(Calculator):
         self.jit_operator_modules.update(modules)
         self.jit_diagnostics = (*self.jit_diagnostics, *diagnostics)
 
+    def _configure_metal_r1(self, model_data):
+        """Move the R1 owners of a loaded FP32 host plugin onto the Metal GPU."""
+
+        from .metal_codegen import metal_r1_metadata, render_jit_r1_metal_source
+
+        loader = getattr(self.evaluator, "_load_metal_r1_module", None)
+        if loader is None:
+            raise RuntimeError("the native evaluator does not provide Metal R1 support")
+        contract = model_data.get("execution_contracts", {}).get("R1")
+        if not contract:
+            raise RuntimeError("Metal R1 execution requires an Execution R1 contract")
+        metadata = metal_r1_metadata(contract)
+        loader(
+            render_jit_r1_metal_source(contract),
+            metadata["channels"],
+            metadata["edge_harmonics"],
+            metadata["source_harmonics"],
+            metadata["output_components"],
+        )
+        if not self.evaluator._metal_r1_module_ready():
+            raise RuntimeError("the evaluator did not retain the Metal R1 module")
+        self.metal_status = "ready"
+        self.metal_device = self.evaluator._metal_r1_device_name()
+
+    def metal_statistics(self):
+        """Return Metal R1 launch counts and GPU/staging seconds."""
+
+        query = getattr(self.evaluator, "_metal_r1_statistics", None)
+        return dict(query()) if callable(query) else {}
+
     def _configure_jit(
         self,
         *,
@@ -2454,6 +2495,8 @@ class Symmetrix(Calculator):
             self.jit_edge_policy = selected_edge_policy
             self.jit_node_state_policy = selected_node_state_policy
             self.jit_variant_id = selected_variant_id
+            if specialization == "r1" and jit_backend == "host" and self.metal_request:
+                self._configure_metal_r1(model_data)
             if specialization == "r1" and self.low_memory_request:
                 if jit_backend in ("cuda", "hip"):
                     self._configure_low_memory_operator_modules(

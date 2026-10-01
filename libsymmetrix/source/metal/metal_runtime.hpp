@@ -76,6 +76,10 @@ public:
     std::size_t size() const;
     void* contents() const;
     bool owns_storage() const;
+    // GPU virtual address for device pointers embedded in argument structs.
+    // Buffers referenced only through such pointers must be declared to the
+    // batch with CommandBatch::use_buffer.
+    std::uint64_t gpu_address() const;
 
     template <class T>
     T* data() const { return static_cast<T*>(contents()); }
@@ -143,6 +147,9 @@ public:
     }
     CommandBatch& set_threadgroup_memory(
         std::uint32_t index, std::size_t bytes);
+    // Makes a buffer reached through an embedded GPU address resident for
+    // the dispatches that follow.
+    CommandBatch& use_buffer(const Buffer& buffer, bool written);
 
     // Grid in threads; edge threadgroups may be partial.
     CommandBatch& dispatch_threads(

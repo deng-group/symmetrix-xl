@@ -17,13 +17,15 @@ endif()
 
 option(SYMMETRIX_METAL_SELFTEST "Build the Metal runtime self-test executable." ON)
 
-add_library(symmetrix_metal STATIC metal_runtime.mm)
+add_library(symmetrix_metal STATIC metal_runtime.mm metal_r1_module.cpp)
 set_target_properties(symmetrix_metal PROPERTIES
     OBJCXX_STANDARD 20
     OBJCXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON)
 target_compile_options(symmetrix_metal PRIVATE -fobjc-arc)
-target_include_directories(symmetrix_metal PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(symmetrix_metal
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/../../../symmetrix/source/symmetrix")
 target_link_libraries(symmetrix_metal PUBLIC
     "-framework Metal"
     "-framework Foundation")

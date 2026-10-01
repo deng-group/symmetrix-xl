@@ -40,6 +40,10 @@ namespace symmetrix::execution {
 struct LaunchProfile;
 }
 
+namespace symmetrix::execution::metal {
+class MetalR1Module;
+}
+
 struct ExecutionParameterGradientGroup {
     std::string name;
     std::string layout;
@@ -124,6 +128,17 @@ int execution_cuda_runtime_version() const;
 int execution_cuda_driver_version() const;
 void load_jit_host_plugin(std::string path);
 bool jit_host_plugin_ready() const;
+// FP32 Metal execution of the R1 owners; requires a loaded host plugin.
+void load_metal_r1_module(
+    std::string source,
+    int channels,
+    int edge_harmonics,
+    int source_harmonics,
+    int output_components);
+void clear_metal_r1_module();
+bool metal_r1_module_ready() const;
+std::map<std::string, double> metal_r1_statistics() const;
+std::string metal_r1_device_name() const;
 std::string jit_host_plugin_path() const;
 std::string jit_host_plugin_artifact_id() const;
 void set_factorized_source_strategy(std::string strategy);
@@ -1053,6 +1068,7 @@ std::string factorized_model_payload_fallback_reason;
 std::unique_ptr<JitDevicePlugin> jit_device_plugin;
 #endif
 std::unique_ptr<symmetrix::execution::HostPlugin> jit_host_plugin;
+std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =

@@ -38,6 +38,9 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #include "device_backend.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_r1_module.hpp"
+#endif
 #include "kernel_launch_profile.hpp"
 #include "standard_m0.hpp"
 #include "standard_m1.hpp"
@@ -1352,6 +1355,86 @@ bool MACEKokkos<Precision>::jit_host_plugin_ready() const
     return jit_host_plugin
         && static_cast<bool>(*jit_host_plugin)
         && jit_host_plugin->has_v2_descriptor();
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::load_metal_r1_module(
+    std::string source,
+    const int channels,
+    const int edge_harmonics,
+    const int source_harmonics,
+    const int output_components)
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (!std::is_same_v<Precision, float>) {
+        throw std::invalid_argument(
+            "Metal R1 execution supports FP32 evaluators only.");
+    } else {
+        if (!jit_host_plugin_ready())
+            throw std::invalid_argument(
+                "Metal R1 execution requires a loaded R1 host plugin.");
+        if (channels != num_channels)
+            throw std::invalid_argument(
+                "Metal R1 module channels do not match the model.");
+        metal_r1_module =
+            std::make_shared<symmetrix::execution::metal::MetalR1Module>(
+                source,
+                symmetrix::execution::metal::MetalR1Shape{
+                    channels, edge_harmonics, source_harmonics,
+                    output_components});
+    }
+#else
+    (void)source;
+    (void)channels;
+    (void)edge_harmonics;
+    (void)source_harmonics;
+    (void)output_components;
+    throw std::runtime_error(
+        "This Symmetrix build does not include Metal support.");
+#endif
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::clear_metal_r1_module()
+{
+    metal_r1_module.reset();
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::metal_r1_module_ready() const
+{
+    return static_cast<bool>(metal_r1_module);
+}
+
+template <typename Precision>
+std::map<std::string, double> MACEKokkos<Precision>::metal_r1_statistics() const
+{
+    std::map<std::string, double> values;
+#ifdef SYMMETRIX_ENABLE_METAL
+    if (metal_r1_module) {
+        const auto& statistics = metal_r1_module->statistics();
+        values["forward_launches"] =
+            static_cast<double>(statistics.forward_launches);
+        values["reverse_launches"] =
+            static_cast<double>(statistics.reverse_launches);
+        values["gpu_seconds"] = statistics.gpu_seconds;
+        values["staging_seconds"] = statistics.staging_seconds;
+        values["forward_seconds"] = statistics.forward_seconds;
+        values["source_seconds"] = statistics.source_seconds;
+        values["edge_seconds"] = statistics.edge_seconds;
+    }
+#endif
+    return values;
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::metal_r1_device_name() const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if (metal_r1_module)
+        return metal_r1_module->device_name();
+#endif
+    return {};
 }
 
 template <typename Precision>

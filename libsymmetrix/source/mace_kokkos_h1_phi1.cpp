@@ -30,6 +30,9 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_r1_module.hpp"
+#endif
 #include "cblas.hpp"
 #include "device_backend.hpp"
 #include "kernel_launch_profile.hpp"
@@ -1507,6 +1510,19 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                     H1.data(),
                     Phi1.data(),
                     r_cut};
+#ifdef SYMMETRIX_ENABLE_METAL
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (metal_r1_module) {
+                        metal_r1_module->forward(args, {
+                            node_types.extent(0),
+                            type_to_active.extent(0),
+                            H1.extent(0)});
+                        factorized_jit_launch_count += 1;
+                        factorized_jit_forward_launch_count += 1;
+                        return;
+                    }
+                }
+#endif
                 const auto owner =
                     jit_host_plugin->descriptor_v2().r1_forward_owner;
                 constexpr int forward_channel_tile = 16;

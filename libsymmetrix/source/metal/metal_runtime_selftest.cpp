@@ -59,6 +59,21 @@ kernel void reduce_sum(
     }
 }
 
+// Packets with embedded device pointers, as used by generated R1 kernels.
+struct PointerPacket {
+    device const float* x;
+    device float* y;
+    uint n;
+};
+
+kernel void packet_scale(
+    constant PointerPacket& packet [[buffer(0)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < packet.n)
+        packet.y[i] = 3.0f*packet.x[i];
+}
+
 kernel void probe(
     device uint* out [[buffer(0)]],
     uint width [[threads_per_simdgroup]],
@@ -236,6 +251,31 @@ int main()
                 "unaligned host memory is rejected");
         }
         std::free(host);
+    }
+
+    // Embedded GPU addresses in an inline argument packet.
+    {
+        const std::uint32_t count = 1000;
+        const mtl::Buffer in = device.allocate(count*sizeof(float));
+        const mtl::Buffer out = device.allocate(count*sizeof(float));
+        for (std::uint32_t i = 0; i < count; ++i)
+            in.data<float>()[i] = static_cast<float>(i);
+        const struct {
+            std::uint64_t x;
+            std::uint64_t y;
+            std::uint32_t n;
+            std::uint32_t pad;
+        } packet{in.gpu_address(), out.gpu_address(), count, 0};
+        const mtl::Pipeline scale = device.pipeline(library, "packet_scale");
+        auto batch = device.begin();
+        batch.use_buffer(in, false).use_buffer(out, true)
+            .set_value(0, packet).dispatch_threads(scale, {count}, {64});
+        batch.submit_and_wait();
+        bool exact = true;
+        for (std::uint32_t i = 0; i < count; ++i)
+            exact = exact && out.data<float>()[i] == 3.0f*static_cast<float>(i);
+        check(in.gpu_address() != 0 && exact,
+            "kernel dereferences device pointers embedded in a packet");
     }
 
     // Error reporting.

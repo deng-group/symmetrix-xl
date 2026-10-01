@@ -1,0 +1,76 @@
+#pragma once
+
+// FP32 Metal execution of the R1 interaction behind the host-plugin packets.
+// Evaluator views stay in Kokkos host memory; each launch stages its inputs
+// into shared Metal buffers, converts double radii and geometry to FP32, and
+// copies the outputs back. Spline coefficients are uploaded once per view.
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include "jit_host_plugin_abi.h"
+
+namespace symmetrix::execution::metal {
+
+struct MetalR1Shape {
+    std::int32_t channels = 0;
+    std::int32_t edge_harmonics = 0;
+    std::int32_t source_harmonics = 0;
+    std::int32_t output_components = 0;
+};
+
+// Element counts of the views behind a packet. Pointer fields of the packet
+// carry no extents, and the evaluator may pass views longer than the graph.
+struct MetalR1ForwardExtents {
+    std::size_t node_types = 0;
+    std::size_t type_to_active = 0;
+    std::size_t neighbor_feature_nodes = 0;
+};
+
+struct MetalR1ReverseExtents {
+    std::size_t node_types = 0;
+    std::size_t type_to_active = 0;
+    std::size_t receivers = 0;
+    std::size_t neighbor_feature_nodes = 0;
+};
+
+struct MetalR1Statistics {
+    std::uint64_t forward_launches = 0;
+    std::uint64_t reverse_launches = 0;
+    double gpu_seconds = 0.0;
+    double staging_seconds = 0.0;
+    // Per-kernel GPU time, recorded only when SYMMETRIX_METAL_PROFILE=1
+    // submits each kernel in its own command buffer.
+    double forward_seconds = 0.0;
+    double source_seconds = 0.0;
+    double edge_seconds = 0.0;
+};
+
+class MetalR1Module {
+public:
+    MetalR1Module(std::string_view msl_source, const MetalR1Shape& shape);
+    ~MetalR1Module();
+    MetalR1Module(const MetalR1Module&) = delete;
+    MetalR1Module& operator=(const MetalR1Module&) = delete;
+
+    const MetalR1Shape& shape() const;
+    const std::string& device_name() const;
+    const MetalR1Statistics& statistics() const;
+
+    void forward(
+        const SymmetrixJitHostR1ForwardArgsV2& args,
+        const MetalR1ForwardExtents& extents);
+    void reverse(
+        const SymmetrixJitHostR1SourceArgsV2& source,
+        const SymmetrixJitHostR1EdgeArgsV2& edge,
+        const MetalR1ReverseExtents& extents);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace symmetrix::execution::metal
