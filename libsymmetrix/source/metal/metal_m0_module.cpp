@@ -107,6 +107,16 @@ const MetalM0Statistics& MetalM0Module::statistics() const
     return impl_->statistics;
 }
 
+void MetalM0Module::discard_pending_results()
+{
+    impl_->fused_linear = {};
+}
+
+void MetalM0Module::release_persistent_tables()
+{
+    impl_->staging->release_tables();
+}
+
 void MetalM0Module::set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory)
 {
     impl_->staging->set_host_memory(std::move(host_memory));

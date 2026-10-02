@@ -451,6 +451,11 @@ const MetalR0Statistics& MetalR0Module::statistics() const
     return impl_->statistics;
 }
 
+void MetalR0Module::release_persistent_tables()
+{
+    impl_->staging->release_tables();
+}
+
 void MetalR0Module::set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory)
 {
     impl_->staging->set_host_memory(std::move(host_memory));

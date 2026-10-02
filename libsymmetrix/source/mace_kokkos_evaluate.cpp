@@ -1601,6 +1601,7 @@ void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
             prepare_mh0_state_policy_views();
             factorized_distributed_start = std::chrono::steady_clock::now();
             begin_factorized_production_evaluation();
+            metal_h1_fusion_enabled = false;
             factorized_prepared_evaluation_count += 1;
             factorized_topology_validation_skip_count += 1;
             ensure_execution_result_capacity(
@@ -1647,6 +1648,7 @@ void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
     prepare_mh0_state_policy_views();
     factorized_distributed_start = std::chrono::steady_clock::now();
     begin_factorized_production_evaluation();
+    metal_h1_fusion_enabled = false;
     factorized_prepared_evaluation_count += 1;
     factorized_topology_validation_skip_count += 1;
 

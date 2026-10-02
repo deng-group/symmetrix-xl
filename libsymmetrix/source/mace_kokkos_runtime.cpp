@@ -1412,6 +1412,35 @@ MACEKokkos<Precision>::ensure_metal_views()
 #endif
 
 template <typename Precision>
+void MACEKokkos<Precision>::release_metal_tables()
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if (metal_r0_module)
+        metal_r0_module->release_persistent_tables();
+    if (metal_r1_module)
+        metal_r1_module->release_persistent_tables();
+    if (metal_m0_module)
+        metal_m0_module->release_persistent_tables();
+    if (metal_m1_module)
+        metal_m1_module->release_persistent_tables();
+#endif
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::begin_metal_evaluation()
+{
+    metal_h1_fusion_enabled = true;
+#ifdef SYMMETRIX_ENABLE_METAL
+    if (metal_r1_module)
+        metal_r1_module->discard_pending_results();
+    if (metal_m0_module)
+        metal_m0_module->discard_pending_results();
+    if (metal_m1_module)
+        metal_m1_module->discard_pending_results();
+#endif
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::clear_metal_r1_module()
 {
     metal_r1_module.reset();

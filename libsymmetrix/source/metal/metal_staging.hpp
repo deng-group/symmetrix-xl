@@ -197,7 +197,11 @@ public:
         return buffer;
     }
 
-    // For tables whose host storage is immutable for the model lifetime.
+    // Drops every cached table. The owner calls this whenever host tables are
+    // rebuilt, since a new allocation can reuse a freed table's address.
+    void release_tables() { tables_.clear(); }
+
+    // For tables whose host storage is unchanged until release_tables().
     const Buffer& persistent(const void* host, const std::size_t bytes)
     {
         auto cached = std::find_if(tables_.begin(), tables_.end(),

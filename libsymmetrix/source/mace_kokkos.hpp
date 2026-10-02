@@ -1120,6 +1120,13 @@ std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> metal_views;
 #ifdef SYMMETRIX_ENABLE_METAL
 std::shared_ptr<const symmetrix::execution::metal::HostMemoryMap> ensure_metal_views();
 #endif
+// Drops the Metal modules' device copies of host tables after a rebuild.
+void release_metal_tables();
+// Clears results that Metal modules keep for later stages of one evaluation.
+void begin_metal_evaluation();
+// The fused M0 forward writes H1 in place; distributed evaluations rebind H1
+// to caller buffers, so they compute it separately.
+bool metal_h1_fusion_enabled = true;
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =

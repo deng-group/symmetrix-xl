@@ -237,6 +237,42 @@ def test_metal_rejects_unqualified_model_families(model_type, tmp_path):
         Symmetrix(model, dtype="float32", metal=True)
 
 
+def test_metal_follows_changes_of_the_element_set(omat_small_model):
+    from symmetrix import Symmetrix
+
+    # Each element set rebuilds the radial tables; a new table can reuse the
+    # address of a freed one, so device copies must not be keyed by address.
+    species = [8, 20, 22, 38, 40, 56]
+
+    def perovskite(a_site, b_site):
+        atoms = crystal(
+            [a_site, b_site, "O"],
+            basis=[(0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0)],
+            spacegroup=221,
+            cellpar=[3.95, 3.95, 3.95, 90, 90, 90],
+        ).repeat((2, 2, 2))
+        atoms.rattle(stdev=0.05, seed=3)
+        return atoms
+
+    host = Symmetrix(omat_small_model, species=species, dtype="float32")
+    metal = Symmetrix(omat_small_model, species=species, dtype="float32", metal=True)
+    for a_site, b_site in [
+        ("Sr", "Ti"), ("Ba", "Ti"), ("Ca", "Ti"), ("Sr", "Zr"),
+        ("Ba", "Zr"), ("Ca", "Zr"), ("Ba", "Ti"), ("Sr", "Zr"),
+    ]:
+        results = {}
+        for name, calculator in (("host", host), ("metal", metal)):
+            atoms = perovskite(a_site, b_site)
+            atoms.calc = calculator
+            results[name] = (atoms.get_potential_energy(), atoms.get_forces())
+        label = f"{a_site}{b_site}O3"
+        energy_error = abs(results["metal"][0] - results["host"][0]) / len(atoms)
+        assert energy_error < 1e-4, label
+        np.testing.assert_allclose(
+            results["metal"][1], results["host"][1], atol=2e-3, err_msg=label
+        )
+
+
 def test_metal_r0_reverse_chunks_match_one_chunk(omat_small_model, tmp_path):
     import subprocess
 

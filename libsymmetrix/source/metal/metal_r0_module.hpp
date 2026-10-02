@@ -64,6 +64,9 @@ public:
 
     // Host ranges in this map are read and written in place.
     void set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory);
+    // Forgets device copies of weight and spline tables; call after the
+    // evaluator rebuilds any of them.
+    void release_persistent_tables();
 
     // values[edge, lm]: normalized spherical harmonics of FP32 unit
     // directions, zero where radius >= cutoff.

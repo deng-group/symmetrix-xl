@@ -1574,7 +1574,8 @@ void MACEKokkos<Precision>::compute_M0_module(
                     // H1 = M0 W_l per degree, fused into this submission;
                     // compute_H1 consumes the result.
                     symmetrix::execution::metal::MetalM0LinearRequest h1_request;
-                    const bool fuse_h1 = L_max >= 0 && L_max <= 3
+                    const bool fuse_h1 = metal_h1_fusion_enabled
+                        && L_max >= 0 && L_max <= 3
                         && M0.extent_int(1) == num_LM
                         && M0.span_is_contiguous()
                         && H1_weights.extent_int(0) == L_max+1

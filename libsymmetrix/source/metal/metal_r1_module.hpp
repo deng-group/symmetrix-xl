@@ -90,6 +90,12 @@ public:
 
     // Host ranges in this map are read and written in place.
     void set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory);
+    // Forgets device copies of weight and spline tables; call after the
+    // evaluator rebuilds any of them.
+    void release_persistent_tables();
+    // Forgets results kept for a later stage of the same evaluation; the
+    // evaluator calls this when an evaluation begins.
+    void discard_pending_results();
 
     // With a1_request, the A1 GEMMs run in the same submission and the next
     // a1_forward for this Phi1 and A1 returns without a launch.

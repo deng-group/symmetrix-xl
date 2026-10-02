@@ -180,7 +180,7 @@ struct MetalR1Module::Impl {
         return staging->zeroed(name, count);
     }
 
-    // The evaluator keeps spline views alive for the model lifetime.
+    // Cached by host address until the evaluator rebuilds the radial tables.
     MetalR1RadialSpline spline(
         const SymmetrixJitHostRadialSplineV2& radial, CommandBatch& batch)
     {
@@ -241,6 +241,18 @@ const MetalR1Shape& MetalR1Module::shape() const { return impl_->shape; }
 const std::string& MetalR1Module::device_name() const
 {
     return impl_->device_name;
+}
+
+void MetalR1Module::discard_pending_results()
+{
+    impl_->phi1 = {};
+    impl_->phi1_adjoint = {};
+    impl_->fused_a1 = {};
+}
+
+void MetalR1Module::release_persistent_tables()
+{
+    impl_->staging->release_tables();
 }
 
 void MetalR1Module::set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory)
