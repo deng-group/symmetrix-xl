@@ -764,6 +764,11 @@ class Symmetrix(Calculator):
                     "on Linux use the CPU or CUDA backend (selected with "
                     "SYMMETRIX_BACKEND) and leave metal unset"
                 )
+            # Argument errors come before build and device checks.
+            if dtype != "float32":
+                raise ValueError(
+                    "metal=True requires dtype='float32'; Metal has no FP64"
+                )
             if not getattr(symmetrix, "_metal_supported", lambda: False)():
                 raise RuntimeError(
                     "metal=True requires a build with the Metal layer "
@@ -774,8 +779,6 @@ class Symmetrix(Calculator):
             )()
             if not ready:
                 raise RuntimeError(f"metal=True has no usable Metal GPU: {reason}")
-        if self.metal_request and dtype != "float32":
-            raise ValueError("metal=True requires dtype='float32'; Metal has no FP64")
         self.dispersion = bool(dispersion)
         self._dispersion_calculator = None
         self._dispersion_properties = ()

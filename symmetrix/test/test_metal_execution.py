@@ -78,9 +78,12 @@ def test_metal_r1_metadata_matches_host_plugin_shape():
     assert metadata["output_components"] > 0
 
 
-def test_metal_requires_float32(tmp_path):
+def test_metal_requires_float32(tmp_path, monkeypatch):
     from symmetrix import Symmetrix
 
+    # The dtype is validated before the build and device checks, so this
+    # holds on any macOS machine and, with the platform pinned, elsewhere.
+    monkeypatch.setattr(sys, "platform", "darwin")
     with pytest.raises(ValueError, match="Metal has no FP64"):
         Symmetrix(tmp_path / "unused.json", dtype="float64", metal=True)
 
