@@ -119,7 +119,9 @@ inline EvaluationPoint evaluation_point(
 }
 
 // Coefficients are interleaved [edge_type, interval, function] float4 so one
-// load fetches the cubic of one radial function.
+// load fetches the cubic of one radial function. This speeds the edge pass by
+// about 30% and slows the value-only source pass by about 5% on an M1 Max; a
+// second, non-interleaved table for the source pass was not worth its memory.
 inline ulong radial_index(
     constant MetalR1RadialSpline& radial,
     int edge_type,
