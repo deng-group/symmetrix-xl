@@ -255,6 +255,9 @@ def test_single_worker_host_batches_dense_linears():
     assert "symmetrix::host_batched_h2_forward<Precision>(" in second_interaction
     assert "symmetrix::host_batched_h2_reverse<Precision>(" in second_interaction
     assert readout.count("symmetrix_blas_gemm<Precision>(") == 4
+    mlp = (NATIVE / "multilayer_perceptron_kokkos.cpp").read_text()
+    assert "if (execution_space.concurrency() == 1) {" in mlp
+    assert mlp.count("symmetrix_blas_gemm<double>(") == 2
 
 
 def test_host_dense_backend_uses_qualified_blas_for_parallel_openmp():
