@@ -67,6 +67,28 @@ void launch_host_h1_gemm(
     const WeightView weight,
     const OutputView output)
 {
+    if (num_nodes == 0)
+        return;
+    if (execution_space.concurrency() == 1) {
+        // With one host worker there is no node parallelism to preserve, so
+        // each lm component becomes one GEMM over all nodes; the node-major
+        // rows are strided by the input and output node pitch.
+        Kokkos::Profiling::pushRegion(label);
+        execution_space.fence();
+        for (int l=0; l<=l_max; ++l)
+            for (int lm=l*l; lm<(l+1)*(l+1); ++lm)
+                symmetrix_blas_gemm<Precision>(
+                    CblasRowMajor, CblasNoTrans,
+                    TransposeWeight ? CblasTrans : CblasNoTrans,
+                    num_nodes, num_channels, num_channels,
+                    Precision(1), &input(0,lm,0),
+                    static_cast<int>(input.stride(0)),
+                    &weight(l,0,0), num_channels,
+                    Precision(0), &output(0,lm,0),
+                    static_cast<int>(output.stride(0)));
+        Kokkos::Profiling::popRegion();
+        return;
+    }
     Kokkos::parallel_for(
         label,
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,

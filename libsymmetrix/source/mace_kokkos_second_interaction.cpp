@@ -37,6 +37,7 @@
 #include "cblas.hpp"
 #include "device_backend.hpp"
 #include "factorized_blas.hpp"
+#include "host_batched_readout.hpp"
 #include "host_dense_kernels.hpp"
 #include "standard_m1.hpp"
 #include "host_worker_blas.hpp"
@@ -1236,6 +1237,22 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
             Kokkos::HostSpace>) {
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()
+                && num_channels <= host_h2_blas_max_channels
+                && execution_space.concurrency() == 1 && num_nodes > 0) {
+            // One host worker: batched GEMMs instead of per-node GEMVs.
+            Kokkos::Profiling::pushRegion("Compute H2 host BLAS");
+            execution_space.fence();
+            symmetrix::host_batched_h2_forward<Precision>(
+                num_nodes, num_channels, node_types.data(),
+                H1.data(), H1.stride(0), M1.data(), M1.stride(0),
+                H2_weights_for_H1.data(), H2_weights_for_H1.stride(0),
+                H2_weights_for_M1.data(), H2.data(), H2.stride(0));
+            Kokkos::Profiling::popRegion();
+            complete_device_stage("MACEKokkos::compute_H2");
+            return;
+        }
+        if (symmetrix::host_worker_cblas_enabled()
+                && !symmetrix::host_dense_backend_overrides_cblas()
                 && num_channels <= host_h2_blas_max_channels) {
             Kokkos::parallel_for(
                 "Compute H2 host BLAS",
@@ -1343,6 +1360,23 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
+        if (symmetrix::host_worker_cblas_enabled()
+                && !symmetrix::host_dense_backend_overrides_cblas()
+                && num_channels <= host_h2_blas_max_channels
+                && execution_space.concurrency() == 1 && num_nodes > 0) {
+            // One host worker: batched GEMMs instead of per-node GEMVs.
+            Kokkos::Profiling::pushRegion("Reverse H2 host BLAS");
+            execution_space.fence();
+            symmetrix::host_batched_h2_reverse<Precision>(
+                num_nodes, num_channels, node_types.data(),
+                H2_adj.data(), H2_adj.stride(0),
+                H2_weights_for_H1.data(), H2_weights_for_H1.stride(0),
+                H2_weights_for_M1.data(), H1_adj.data(), H1_adj.stride(0),
+                M1_adj.data(), M1_adj.stride(0));
+            Kokkos::Profiling::popRegion();
+            complete_device_stage("MACEKokkos::reverse_H2");
+            return;
+        }
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()
                 && num_channels <= host_h2_blas_max_channels) {
