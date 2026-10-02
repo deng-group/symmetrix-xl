@@ -179,6 +179,8 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     # The A1 GEMMs share the R1 forward submission, and the A1 density
     # scaling runs on the GPU over the shared A1 rows.
     assert statistics["fused_a1_launches"] >= 1
+    # H1 = M0 W runs in the Metal M0 forward submission.
+    assert statistics["m0_fused_linear_launches"] >= 1
     assert statistics["row_scale_launches"] >= 1
     assert host.metal_status == "disabled"
     # FP32 summation order differs between the host owners and the GPU.

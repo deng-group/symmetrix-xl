@@ -31,6 +31,7 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_m0_module.hpp"
 #include "metal_r1_module.hpp"
 #include "metal_view_registry.hpp"
 #endif
@@ -208,6 +209,16 @@ void MACEKokkos<Precision>::compute_H1(
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     if (H1.extent(0) < M0.extent(0))
         Kokkos::realloc(H1, M0.extent(0), M0.extent(1), M0.extent(2));
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>) {
+        // The Metal M0 forward already wrote H1 in its submission.
+        if (metal_m0_module
+                && metal_m0_module->take_fused_linear(M0.data(), H1.data(), num_nodes)) {
+            complete_device_stage("MACEKokkos::compute_H1");
+            return;
+        }
+    }
+#endif
 
     auto L_max = this->L_max;
     const int channels = num_channels;

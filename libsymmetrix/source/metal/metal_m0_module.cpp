@@ -46,6 +46,11 @@ struct MetalM0Module::Impl {
     MetalM0Shape shape;
     std::unique_ptr<MetalStaging> staging;
     MetalM0Statistics statistics;
+    struct FusedLinear {
+        const float* output = nullptr;
+        const float* linear_output = nullptr;
+        std::size_t nodes = 0;
+    } fused_linear;
 
     std::size_t padded_channels() const
     {
@@ -113,9 +118,11 @@ void MetalM0Module::forward(
     const float* input,
     const float* weights,
     const std::size_t weight_count,
-    float* output)
+    float* output,
+    const MetalM0LinearRequest* linear)
 {
     auto& m = *impl_;
+    m.fused_linear = {};
     const std::size_t nodes = m.checked_nodes(num_nodes);
     if (nodes == 0)
         return;
@@ -139,12 +146,52 @@ void MetalM0Module::forward(
         batch.use_buffer(*buffer, false);
     batch.use_buffer(*out.buffer, true).set_value(0, args)
         .dispatch_threads(m.forward, {nodes*m.padded_channels()}, {threadgroup_size});
+    const std::size_t components = static_cast<std::size_t>(m.shape.output_components);
+    if (linear != nullptr) {
+        if (linear->l_max < 0 || linear->weights == nullptr || linear->output == nullptr
+                || static_cast<std::size_t>((linear->l_max+1)*(linear->l_max+1)) != components)
+            m.staging->fail("linear request does not match the output components");
+        if (nodes > UINT32_MAX)
+            m.staging->fail("linear request exceeds the 32-bit GEMM row range");
+        const DeviceSpan mixed = m.staging->output(
+            "linear_output", linear->output, nodes*components*channels);
+        const auto rows = static_cast<std::uint32_t>(nodes);
+        const auto c = static_cast<std::uint32_t>(channels);
+        const std::size_t row_bytes = components*channels*sizeof(float);
+        // Each lm row of every node is one strided GEMM with its degree's weights.
+        for (int l = 0; l <= linear->l_max; ++l) {
+            const Buffer& w_l = m.staging->persistent(
+                linear->weights+static_cast<std::size_t>(l)*channels*channels,
+                channels*channels*sizeof(float));
+            for (int lm = l*l; lm < (l+1)*(l+1); ++lm) {
+                const std::size_t column = static_cast<std::size_t>(lm)*channels*sizeof(float);
+                batch.gemm({out.buffer, out.offset+column, rows, c, row_bytes},
+                    {&w_l, 0, c, c, channels*sizeof(float)},
+                    {mixed.buffer, mixed.offset+column, rows, c, row_bytes});
+            }
+        }
+    }
     m.statistics.staging_seconds += seconds_since(staging);
     m.statistics.gpu_seconds += batch.submit_and_wait().gpu_seconds;
     const auto readback = Clock::now();
     m.staging->complete();
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.forward_launches;
+    if (linear != nullptr) {
+        m.fused_linear = {output, linear->output, nodes};
+        ++m.statistics.fused_linear_launches;
+    }
+}
+
+bool MetalM0Module::take_fused_linear(
+    const float* output, const float* linear_output, const std::int64_t num_nodes)
+{
+    auto& m = *impl_;
+    const bool ready = num_nodes > 0 && m.fused_linear.output == output
+        && m.fused_linear.linear_output == linear_output
+        && m.fused_linear.nodes == static_cast<std::size_t>(num_nodes);
+    m.fused_linear = {};
+    return ready;
 }
 
 void MetalM0Module::reverse(

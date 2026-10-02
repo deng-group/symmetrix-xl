@@ -1549,6 +1549,8 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["m0_reverse_launches"] =
             static_cast<double>(statistics.reverse_launches);
         values["m0_gpu_seconds"] = statistics.gpu_seconds;
+        values["m0_fused_linear_launches"] =
+            static_cast<double>(statistics.fused_linear_launches);
         values["m0_staging_seconds"] = statistics.staging_seconds;
     }
     if (metal_r0_module) {

@@ -19,11 +19,21 @@ struct MetalM0Shape {
     std::int32_t term_count = 0;
 };
 
+// A per-degree channel mixing applied to the M0 output in the same
+// submission: output[node, lm, :] = m0[node, lm, :] weights[l(lm)], with
+// weights [l_max+1, channels, channels] row-major.
+struct MetalM0LinearRequest {
+    std::int32_t l_max = -1;
+    const float* weights = nullptr;
+    float* output = nullptr;
+};
+
 struct MetalM0Statistics {
     std::uint64_t forward_launches = 0;
     std::uint64_t reverse_launches = 0;
     double gpu_seconds = 0.0;
     double staging_seconds = 0.0;
+    std::uint64_t fused_linear_launches = 0;
 };
 
 class MetalM0Module {
@@ -48,7 +58,13 @@ public:
         const float* input,
         const float* weights,
         std::size_t weight_count,
-        float* output);
+        float* output,
+        const MetalM0LinearRequest* linear = nullptr);
+
+    // True once, when the previous forward fused the linear request that
+    // maps this output to linear_output for num_nodes nodes.
+    bool take_fused_linear(
+        const float* output, const float* linear_output, std::int64_t num_nodes);
 
     // Writes input_adjoint and, when requested, adds sum_c x*grad per node to
     // the FP64 input_scale_adjoint.
