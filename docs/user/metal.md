@@ -83,6 +83,7 @@ Benchmarks on a laptop are sensitive to other GPU and CPU load. Animated wallpap
 ## Limitations
 
 - FP32 only.
+- Two-interaction standard MACE models only. `metal=True` rejects MACEField, MACE-MH-1 (`MACE_Nonlinear`), and single-layer models, which have not been qualified on the Metal stages; evaluate them on the CPU.
 - The Metal R0 stage supports spherical harmonics up to `l_max` 3, which covers the MACE-MP-0 and OMAT-0 medium models. The fastest R1 edge kernel needs a channel count that is a multiple of 32; other channel counts use a slower per-edge kernel.
 - One process uses one GPU; there is no LAMMPS or MPI support for the Metal backend yet.
 - The first evaluation in a process compiles the GPU kernels, which takes a fraction of a second.
