@@ -1470,10 +1470,59 @@ bool MACEKokkos<Precision>::metal_m0_module_ready() const
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::load_metal_m1_module(
+    std::string source,
+    const int channels,
+    const int input_components,
+    const int output_components,
+    const int term_count)
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (!std::is_same_v<Precision, float>) {
+        throw std::invalid_argument(
+            "Metal M1 execution supports FP32 evaluators only.");
+    } else {
+        if (channels != num_channels || input_components != num_lm
+                || output_components != 1)
+            throw std::invalid_argument(
+                "Metal M1 module shape does not match the model.");
+        metal_m1_module =
+            std::make_shared<symmetrix::execution::metal::MetalM0Module>(
+                source,
+                symmetrix::execution::metal::MetalM0Shape{
+                    channels, input_components, output_components, term_count});
+    }
+#else
+    (void)source;
+    (void)channels;
+    (void)input_components;
+    (void)output_components;
+    (void)term_count;
+    throw std::runtime_error(
+        "This Symmetrix build does not include Metal support.");
+#endif
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::metal_m1_module_ready() const
+{
+    return static_cast<bool>(metal_m1_module);
+}
+
+template <typename Precision>
 std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
 {
     std::map<std::string, double> values;
 #ifdef SYMMETRIX_ENABLE_METAL
+    if (metal_m1_module) {
+        const auto& statistics = metal_m1_module->statistics();
+        values["m1_forward_launches"] =
+            static_cast<double>(statistics.forward_launches);
+        values["m1_reverse_launches"] =
+            static_cast<double>(statistics.reverse_launches);
+        values["m1_gpu_seconds"] = statistics.gpu_seconds;
+        values["m1_staging_seconds"] = statistics.staging_seconds;
+    }
     if (metal_m0_module) {
         const auto& statistics = metal_m0_module->statistics();
         values["m0_forward_launches"] =
@@ -1510,6 +1559,8 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["resident_uploads_skipped"] =
             static_cast<double>(statistics.resident_uploads_skipped);
         values["a1_seconds"] = statistics.a1_seconds;
+        values["tiled_edge_launches"] =
+            static_cast<double>(statistics.tiled_edge_launches);
     }
 #endif
     return values;

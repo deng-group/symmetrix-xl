@@ -53,6 +53,8 @@ struct MetalR1Module::Impl {
     Pipeline forward;
     Pipeline source;
     Pipeline edge;
+    // Present when the receiver adjoint fits in threadgroup memory.
+    Pipeline edge_tiled;
     MetalR1Shape shape;
     std::string device_name;
     MetalR1Statistics statistics;
@@ -130,10 +132,13 @@ MetalR1Module::MetalR1Module(
     impl_->device = Device::system_default();
     impl_->device_name = impl_->device.information().device_name;
     impl_->staging = std::make_unique<MetalStaging>(impl_->device, "R1");
-    const Library library = impl_->device.compile(msl_source);
+    const Library library =
+        impl_->device.compile(msl_source, module_compile_options());
     impl_->forward = impl_->device.pipeline(library, "symmetrix_r1_forward");
     impl_->source = impl_->device.pipeline(library, "symmetrix_r1_source");
     impl_->edge = impl_->device.pipeline(library, "symmetrix_r1_edge");
+    if (library.has_function("symmetrix_r1_edge_tiled"))
+        impl_->edge_tiled = impl_->device.pipeline(library, "symmetrix_r1_edge_tiled");
     for (const Pipeline* pipeline :
             {&impl_->forward, &impl_->source, &impl_->edge}) {
         if (pipeline->max_total_threads_per_threadgroup() < threadgroup_size)
@@ -360,9 +365,35 @@ void MetalR1Module::reverse(
         batch.use_buffer(forces, true);
         m.spline(edge.radial, batch);
     }
-    // One 32-lane SIMD group per edge; the kernel splits channels by lane.
-    batch.set_value(0, edge_packet)
-        .dispatch_threads(m.edge, {edges*simd_width}, {threadgroup_size});
+    // Receiver-ordered edges let one threadgroup share its receiver's adjoint
+    // rows; otherwise one 32-lane SIMD group owns each edge.
+    // Receiver-ordered edges let one threadgroup share its receiver's adjoint
+    // rows; otherwise one 32-lane SIMD group owns each edge.
+    bool receiver_ordered = static_cast<bool>(m.edge_tiled);
+    std::int32_t previous = 0;
+    for (std::size_t e = 0; receiver_ordered && e < edges; ++e) {
+        const std::int32_t receiver = source.edge_receivers[e];
+        receiver_ordered = receiver >= previous
+            && static_cast<std::size_t>(receiver) < extents.receivers;
+        previous = receiver;
+    }
+    if (receiver_ordered) {
+        const std::size_t receiver_count = static_cast<std::size_t>(previous)+1;
+        Buffer& offsets = m.slot("receiver_offsets",
+            (receiver_count+1)*sizeof(std::int32_t));
+        auto* offset = offsets.data<std::int32_t>();
+        std::fill(offset, offset+receiver_count+1, 0);
+        for (std::size_t e = 0; e < edges; ++e)
+            ++offset[source.edge_receivers[e]+1];
+        for (std::size_t r = 0; r < receiver_count; ++r)
+            offset[r+1] += offset[r];
+        batch.set_value(0, edge_packet).set_buffer(1, offsets)
+            .dispatch_threadgroups(m.edge_tiled, {receiver_count}, {threadgroup_size});
+        ++m.statistics.tiled_edge_launches;
+    } else {
+        batch.set_value(0, edge_packet)
+            .dispatch_threads(m.edge, {edges*simd_width}, {threadgroup_size});
+    }
     m.statistics.staging_seconds += seconds_since(staging);
 
     const double edge_seconds = batch.submit_and_wait().gpu_seconds;

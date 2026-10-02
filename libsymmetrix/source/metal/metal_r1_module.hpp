@@ -65,6 +65,7 @@ struct MetalR1Statistics {
     std::uint64_t a1_reverse_launches = 0;
     std::uint64_t resident_uploads_skipped = 0;
     double a1_seconds = 0.0;
+    std::uint64_t tiled_edge_launches = 0;
 };
 
 class MetalR1Module {

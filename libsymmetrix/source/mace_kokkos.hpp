@@ -150,6 +150,14 @@ void load_metal_m0_module(
     int output_components,
     int term_count);
 bool metal_m0_module_ready() const;
+// FP32 Metal execution of the standard M1 contraction with the M0 kernels.
+void load_metal_m1_module(
+    std::string source,
+    int channels,
+    int input_components,
+    int output_components,
+    int term_count);
+bool metal_m1_module_ready() const;
 // Fills the per-degree A1 layout consumed by the Metal R1 module; returns
 // false when the model's A1 blocks fall outside its supported shape.
 bool metal_a1_layout(void* layout) const;
@@ -1099,6 +1107,7 @@ std::unique_ptr<symmetrix::execution::HostPlugin> jit_host_plugin;
 std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
 std::shared_ptr<symmetrix::execution::metal::MetalR0Module> metal_r0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m0_module;
+std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m1_module;
 // Harmonic gradients recomputed for Metal R0 when Y_grad is not retained.
 Kokkos::View<Precision*> metal_r0_gradients;
 Kokkos::View<Precision*> execution_receiver_projection;

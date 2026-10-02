@@ -302,7 +302,7 @@ MetalR0Module::MetalR0Module() : impl_(std::make_unique<Impl>())
 {
     impl_->device = Device::system_default();
     impl_->staging = std::make_unique<MetalStaging>(impl_->device, "R0");
-    const Library library = impl_->device.compile(r0_source);
+    const Library library = impl_->device.compile(r0_source, module_compile_options());
     impl_->forward = impl_->device.pipeline(library, "symmetrix_r0_forward");
     impl_->reverse = impl_->device.pipeline(library, "symmetrix_r0_reverse");
     if (impl_->reverse.thread_execution_width() != simd_width)

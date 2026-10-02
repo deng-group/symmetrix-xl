@@ -40,12 +40,16 @@ struct MetalInformation {
 // Queries the system default device without throwing.
 MetalInformation metal_information();
 
+// Floating-point contract for compiled kernels. Safe keeps strict IEEE
+// semantics and forbids fused multiply-add contraction; relaxed allows
+// contraction and reassociation but keeps NaN and infinity handling; fast
+// additionally assumes finite values.
+enum class MathMode { safe, relaxed, fast };
+
 struct CompileOptions {
     // Encoded as major*100 + minor; 300 selects MSL 3.0.
     int language_version = 300;
-    // Fast math reorders FP32 arithmetic and is off by default so that GPU
-    // results remain comparable with the host reference.
-    bool fast_math = false;
+    MathMode math_mode = MathMode::safe;
     std::map<std::string, std::string> macros;
 };
 
@@ -108,6 +112,7 @@ public:
 
     explicit operator bool() const { return static_cast<bool>(impl_); }
     std::string compile_log() const;
+    bool has_function(std::string_view name) const;
 
 private:
     friend class Device;

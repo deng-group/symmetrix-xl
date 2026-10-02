@@ -1856,6 +1856,18 @@ class Symmetrix(Calculator):
                 m0["output_components"],
                 m0["term_count"],
             )
+        load_m1 = getattr(self.evaluator, "_load_metal_m1_module", None)
+        if m0_contract and load_m1 is not None:
+            from .metal_codegen import metal_m1_metadata, render_jit_m1_metal_source
+
+            m1 = metal_m1_metadata(m0_contract)
+            load_m1(
+                render_jit_m1_metal_source(m0_contract),
+                m1["channels"],
+                m1["input_components"],
+                m1["output_components"],
+                m1["term_count"],
+            )
         self.metal_status = "ready"
         self.metal_device = self.evaluator._metal_r1_device_name()
 

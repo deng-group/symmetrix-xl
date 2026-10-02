@@ -31,6 +31,7 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_m0_module.hpp"
 #include "metal_r1_module.hpp"
 #endif
 #include "cblas.hpp"
@@ -736,6 +737,21 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
     ensure_mh0_m1_forward_capacity(num_nodes);
     if (m1_polynomial_policy == M1PolynomialPolicy::recompute) {
         release_m1_polynomial_workspace();
+#ifdef SYMMETRIX_ENABLE_METAL
+        if constexpr (std::is_same_v<Precision, float>) {
+            if (!single_layer_readout && standard_m1_module_ready
+                    && metal_m1_module && A1.span_is_contiguous()
+                    && M1.span_is_contiguous() && M1_weights.span_is_contiguous()) {
+                execution_space.fence();
+                metal_m1_module->forward(
+                    num_nodes, node_types.data(), A1.data(), M1_weights.data(),
+                    M1_weights.size(), M1.data());
+                standard_m1_module_forward_launch_count += 1;
+                m1_recompute_forward_launch_count += 1;
+                return;
+            }
+        }
+#endif
         if (!single_layer_readout && standard_m1_module_ready
             && symmetrix::standard_m1::launch_forward(
                 execution_space, num_nodes, num_channels, node_types,
@@ -890,6 +906,34 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
     if (m1_polynomial_policy == M1PolynomialPolicy::recompute) {
         release_m1_polynomial_workspace();
         const bool capture_scale_adjoint = reuse_adjoint && A1_scaled;
+#ifdef SYMMETRIX_ENABLE_METAL
+        if constexpr (std::is_same_v<Precision, float>) {
+            if (!single_layer_readout && standard_m1_module_ready
+                    && metal_m1_module && A1.span_is_contiguous()
+                    && M1_adj.span_is_contiguous() && A1_adj.span_is_contiguous()
+                    && M1_weights.span_is_contiguous()) {
+                // A1_adj may alias A1: the module reads its staged copy of
+                // A1 and writes the adjoint back only after the kernel.
+                execution_space.fence();
+                // The host owner assigns the per-node scale adjoint; the Metal
+                // module accumulates into it.
+                if (capture_scale_adjoint)
+                    Kokkos::deep_copy(
+                        Kokkos::subview(mh0_a1_scale_adjoint,
+                            Kokkos::make_pair(std::size_t(0),
+                                static_cast<std::size_t>(num_nodes))),
+                        0.0);
+                metal_m1_module->reverse(
+                    num_nodes, node_types.data(), A1.data(), M1_weights.data(),
+                    M1_weights.size(), M1_adj.data(), A1_adj.data(),
+                    capture_scale_adjoint ? mh0_a1_scale_adjoint.data() : nullptr,
+                    capture_scale_adjoint);
+                standard_m1_module_reverse_launch_count += 1;
+                m1_recompute_reverse_launch_count += 1;
+                return;
+            }
+        }
+#endif
         if (!single_layer_readout && standard_m1_module_ready
             && symmetrix::standard_m1::launch_reverse(
                 execution_space, num_nodes, num_channels, node_types,

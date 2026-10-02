@@ -158,10 +158,14 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     assert statistics["r0_gpu_seconds"] > 0.0
     assert statistics["m0_forward_launches"] >= 1
     assert statistics["m0_reverse_launches"] >= 1
+    assert statistics["m1_forward_launches"] >= 1
+    assert statistics["m1_reverse_launches"] >= 1
     assert statistics["a1_forward_launches"] >= 1
     assert statistics["a1_reverse_launches"] >= 1
     # dPhi1 produced by the A1 reverse is consumed on the GPU by R1.
     assert statistics["resident_uploads_skipped"] >= 1
+    # The evaluator's edge list is receiver-ordered, so the tiled kernel runs.
+    assert statistics["tiled_edge_launches"] >= 1
     assert host.metal_status == "disabled"
     # FP32 summation order differs between the host owners and the GPU.
     assert abs(e_metal - e_host) / len(atoms) < 1e-5

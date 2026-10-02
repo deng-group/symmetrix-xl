@@ -198,6 +198,15 @@ std::string Library::compile_log() const
     return impl_ ? impl_->log : std::string();
 }
 
+bool Library::has_function(const std::string_view name) const
+{
+    if (!impl_)
+        return false;
+    @autoreleasepool {
+        return [impl_->library.functionNames containsObject:to_ns(name)];
+    }
+}
+
 // ----- Pipeline -----
 
 const std::string& Pipeline::function_name() const
@@ -576,12 +585,16 @@ Library Device::compile(
         settings.languageVersion =
             static_cast<MTLLanguageVersion>((major << 16) | minor);
         if (@available(macOS 15.0, *)) {
-            settings.mathMode =
-                options.fast_math ? MTLMathModeFast : MTLMathModeSafe;
+            switch (options.math_mode) {
+            case MathMode::safe: settings.mathMode = MTLMathModeSafe; break;
+            case MathMode::relaxed: settings.mathMode = MTLMathModeRelaxed; break;
+            case MathMode::fast: settings.mathMode = MTLMathModeFast; break;
+            }
         } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            settings.fastMathEnabled = options.fast_math ? YES : NO;
+            settings.fastMathEnabled =
+                options.math_mode == MathMode::safe ? NO : YES;
 #pragma clang diagnostic pop
         }
         if (!options.macros.empty()) {

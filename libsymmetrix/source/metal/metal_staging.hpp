@@ -17,6 +17,16 @@
 
 namespace symmetrix::execution::metal {
 
+// Compile policy shared by the Symmetrix Metal modules. Relaxed math permits
+// fused multiply-add contraction, which the edge kernels depend on for speed,
+// while keeping the NaN and infinity semantics used by model validation.
+inline CompileOptions module_compile_options()
+{
+    CompileOptions options;
+    options.math_mode = MathMode::relaxed;
+    return options;
+}
+
 class MetalStaging {
 public:
     MetalStaging(Device device, std::string owner)

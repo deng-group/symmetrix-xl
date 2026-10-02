@@ -82,7 +82,7 @@ MetalM0Module::MetalM0Module(
     impl_->shape = shape;
     impl_->device = Device::system_default();
     impl_->staging = std::make_unique<MetalStaging>(impl_->device, "M0");
-    const Library library = impl_->device.compile(msl_source);
+    const Library library = impl_->device.compile(msl_source, module_compile_options());
     impl_->forward = impl_->device.pipeline(library, "symmetrix_m0_forward");
     impl_->reverse = impl_->device.pipeline(library, "symmetrix_m0_reverse");
     if (impl_->reverse.thread_execution_width() != simd_width)
