@@ -42,6 +42,8 @@ struct LaunchProfile;
 
 namespace symmetrix::execution::metal {
 class MetalM0Module;
+class MetalViewRegistry;
+class HostMemoryMap;
 class MetalR0Module;
 class MetalR1Module;
 }
@@ -1107,6 +1109,11 @@ std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
 std::shared_ptr<symmetrix::execution::metal::MetalR0Module> metal_r0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m1_module;
+// Evaluator views that Metal modules access in place; shared by all modules.
+std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> metal_views;
+#ifdef SYMMETRIX_ENABLE_METAL
+std::shared_ptr<const symmetrix::execution::metal::HostMemoryMap> ensure_metal_views();
+#endif
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =

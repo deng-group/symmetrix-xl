@@ -102,6 +102,11 @@ const MetalM0Statistics& MetalM0Module::statistics() const
     return impl_->statistics;
 }
 
+void MetalM0Module::set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory)
+{
+    impl_->staging->set_host_memory(std::move(host_memory));
+}
+
 void MetalM0Module::forward(
     const std::int64_t num_nodes,
     const std::int32_t* node_types,
@@ -117,25 +122,27 @@ void MetalM0Module::forward(
     const std::size_t channels = static_cast<std::size_t>(m.shape.channels);
     const auto staging = Clock::now();
     auto batch = m.device.begin();
-    Buffer& types = m.staging->upload("node_types", node_types, nodes);
-    Buffer& x = m.staging->upload("input", input,
+    m.staging->begin();
+    const DeviceSpan types = m.staging->input("node_types", node_types, nodes);
+    const DeviceSpan x = m.staging->input("input", input,
         nodes*m.shape.input_components*channels);
     const Buffer& w = m.weights(weights, weight_count);
-    const std::size_t output_count = nodes*m.shape.output_components*channels;
-    Buffer& out = m.staging->slot("output", output_count*sizeof(float));
+    const DeviceSpan out = m.staging->output("output", output,
+        nodes*m.shape.output_components*channels);
     const M0Args args{
         static_cast<std::uint32_t>(nodes), 0u,
         static_cast<std::uint32_t>(m.padded_channels()), 0u,
-        types.gpu_address(), x.gpu_address(), w.gpu_address(), 0,
-        out.gpu_address(), 0, 0};
-    for (const Buffer* buffer : std::initializer_list<const Buffer*>{&types, &x, &w})
+        types.address(), x.address(), w.gpu_address(), 0,
+        out.address(), 0, 0};
+    for (const Buffer* buffer :
+            std::initializer_list<const Buffer*>{types.buffer, x.buffer, &w})
         batch.use_buffer(*buffer, false);
-    batch.use_buffer(out, true).set_value(0, args)
+    batch.use_buffer(*out.buffer, true).set_value(0, args)
         .dispatch_threads(m.forward, {nodes*m.padded_channels()}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
     m.statistics.gpu_seconds += batch.submit_and_wait().gpu_seconds;
     const auto readback = Clock::now();
-    std::memcpy(output, out.contents(), output_count*sizeof(float));
+    m.staging->complete();
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.forward_launches;
 }
@@ -161,30 +168,32 @@ void MetalM0Module::reverse(
     const std::size_t blocks = m.padded_channels()/simd_width;
     const auto staging = Clock::now();
     auto batch = m.device.begin();
-    Buffer& types = m.staging->upload("node_types", node_types, nodes);
-    Buffer& x = m.staging->upload("input", input,
+    m.staging->begin();
+    const DeviceSpan types = m.staging->input("node_types", node_types, nodes);
+    const DeviceSpan x = m.staging->input("input", input,
         nodes*m.shape.input_components*channels);
     const Buffer& w = m.weights(weights, weight_count);
-    Buffer& adjoint = m.staging->upload("output_adjoint", output_adjoint,
+    const DeviceSpan adjoint = m.staging->input("output_adjoint", output_adjoint,
         nodes*m.shape.output_components*channels);
-    const std::size_t gradient_count = nodes*m.shape.input_components*channels;
-    Buffer& gradient = m.staging->slot("input_adjoint", gradient_count*sizeof(float));
+    const DeviceSpan gradient = m.staging->output("input_adjoint", input_adjoint,
+        nodes*m.shape.input_components*channels);
     Buffer& partials = m.staging->slot("scale_partials", nodes*blocks*sizeof(float));
     const M0Args args{
         static_cast<std::uint32_t>(nodes),
         capture_input_scale_adjoint ? 1u : 0u,
         static_cast<std::uint32_t>(m.padded_channels()), 0u,
-        types.gpu_address(), x.gpu_address(), w.gpu_address(),
-        adjoint.gpu_address(), 0, gradient.gpu_address(), partials.gpu_address()};
-    for (const Buffer* buffer :
-            std::initializer_list<const Buffer*>{&types, &x, &w, &adjoint})
+        types.address(), x.address(), w.gpu_address(),
+        adjoint.address(), 0, gradient.address(), partials.gpu_address()};
+    for (const Buffer* buffer : std::initializer_list<const Buffer*>{
+            types.buffer, x.buffer, &w, adjoint.buffer})
         batch.use_buffer(*buffer, false);
-    batch.use_buffer(gradient, true).use_buffer(partials, true).set_value(0, args)
+    batch.use_buffer(*gradient.buffer, true).use_buffer(partials, true)
+        .set_value(0, args)
         .dispatch_threads(m.reverse, {nodes*m.padded_channels()}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
     m.statistics.gpu_seconds += batch.submit_and_wait().gpu_seconds;
     const auto readback = Clock::now();
-    std::memcpy(input_adjoint, gradient.contents(), gradient_count*sizeof(float));
+    m.staging->complete();
     if (capture_input_scale_adjoint) {
         const float* values = partials.data<float>();
         for (std::size_t node = 0; node < nodes; ++node) {

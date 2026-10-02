@@ -12,6 +12,8 @@
 
 namespace symmetrix::execution::metal {
 
+class HostMemoryMap;
+
 struct MetalR0Graph {
     std::int32_t num_nodes = 0;
     std::int32_t active_type_count = 0;
@@ -41,6 +43,7 @@ struct MetalR0Spline {
 struct MetalR0Statistics {
     std::uint64_t forward_launches = 0;
     std::uint64_t reverse_launches = 0;
+    std::uint64_t harmonic_launches = 0;
     double gpu_seconds = 0.0;
     double staging_seconds = 0.0;
     double forward_seconds = 0.0;
@@ -58,6 +61,19 @@ public:
     MetalR0Module& operator=(const MetalR0Module&) = delete;
 
     const MetalR0Statistics& statistics() const;
+
+    // Host ranges in this map are read and written in place.
+    void set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory);
+
+    // values[edge, lm]: normalized spherical harmonics of FP32 unit
+    // directions, zero where radius >= cutoff.
+    void harmonic_values(
+        std::size_t edges,
+        std::int32_t harmonic_count,
+        double cutoff,
+        const float* unit_directions,
+        const double* radius,
+        float* values);
 
     // output[receiver, lm, channel] = density_scale(receiver)
     //     * sum_edges R_{l(lm), channel}(r) Y_lm.

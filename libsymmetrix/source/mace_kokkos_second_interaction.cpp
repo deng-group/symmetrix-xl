@@ -33,6 +33,7 @@
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_m0_module.hpp"
 #include "metal_r1_module.hpp"
+#include "metal_view_registry.hpp"
 #endif
 #include "cblas.hpp"
 #include "device_backend.hpp"
@@ -75,6 +76,8 @@ void MACEKokkos<Precision>::compute_A1(
                 && A1.extent(0) >= static_cast<std::size_t>(num_nodes)
                 && A1.span_is_contiguous() && Phi1.span_is_contiguous()) {
             factorized_execution_space.fence();
+            metal_views->map(Phi1);
+            metal_views->map(A1);
             if (metal_r1_module->a1_forward(
                     Phi1.data(), static_cast<std::size_t>(num_nodes),
                     layout, A1.data()))
@@ -385,6 +388,8 @@ void MACEKokkos<Precision>::reverse_A1_from(
                 && output_adjoint.extent_int(1) == num_lm
                 && dPhi1.span_is_contiguous()) {
             factorized_execution_space.fence();
+            metal_views->map(output_adjoint);
+            metal_views->map(dPhi1);
             metal_r1_module->a1_reverse(
                 static_cast<std::size_t>(num_nodes), dPhi1.extent(0), layout,
                 output_adjoint.data(), dPhi1.data());
@@ -854,6 +859,8 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
                     && metal_m1_module && A1.span_is_contiguous()
                     && M1.span_is_contiguous() && M1_weights.span_is_contiguous()) {
                 execution_space.fence();
+                metal_views->map(A1);
+                metal_views->map(M1);
                 metal_m1_module->forward(
                     num_nodes, node_types.data(), A1.data(), M1_weights.data(),
                     M1_weights.size(), M1.data());
@@ -1023,8 +1030,8 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
                     && metal_m1_module && A1.span_is_contiguous()
                     && M1_adj.span_is_contiguous() && A1_adj.span_is_contiguous()
                     && M1_weights.span_is_contiguous()) {
-                // A1_adj may alias A1: the module reads its staged copy of
-                // A1 and writes the adjoint back only after the kernel.
+                // A1_adj may alias A1: the module then stages A1_adj and
+                // writes it back only after the kernel.
                 execution_space.fence();
                 // The host owner assigns the per-node scale adjoint; the Metal
                 // module accumulates into it.
@@ -1034,6 +1041,9 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
                             Kokkos::make_pair(std::size_t(0),
                                 static_cast<std::size_t>(num_nodes))),
                         0.0);
+                metal_views->map(A1);
+                metal_views->map(M1_adj);
+                metal_views->map(A1_adj);
                 metal_m1_module->reverse(
                     num_nodes, node_types.data(), A1.data(), M1_weights.data(),
                     M1_weights.size(), M1_adj.data(), A1_adj.data(),

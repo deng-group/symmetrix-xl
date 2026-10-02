@@ -10,6 +10,8 @@
 
 namespace symmetrix::execution::metal {
 
+class HostMemoryMap;
+
 struct MetalM0Shape {
     std::int32_t channels = 0;
     std::int32_t input_components = 0;
@@ -33,6 +35,9 @@ public:
 
     const MetalM0Shape& shape() const;
     const MetalM0Statistics& statistics() const;
+
+    // Host ranges in this map are read and written in place.
+    void set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory);
 
     // input [nodes, input_components, channels], weights
     // [weight_types, term_count, channels], output [nodes, output_components,

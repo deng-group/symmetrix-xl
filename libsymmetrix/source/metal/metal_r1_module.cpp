@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 
 #include "metal_r1_abi.hpp"
@@ -163,6 +164,11 @@ const std::string& MetalR1Module::device_name() const
     return impl_->device_name;
 }
 
+void MetalR1Module::set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory)
+{
+    impl_->staging->set_host_memory(std::move(host_memory));
+}
+
 const MetalR1Statistics& MetalR1Module::statistics() const
 {
     return impl_->statistics;
@@ -186,6 +192,7 @@ void MetalR1Module::forward(
 
     const auto staging = Clock::now();
     auto batch = m.device.begin();
+    m.staging->begin();
     Buffer& node_types = m.upload("node_types", args.node_types, extents.node_types);
     Buffer& num_neigh = m.upload("num_neigh", args.num_neigh, nodes);
     Buffer& first_neigh = m.upload("first_neigh", args.first_neigh, nodes);
@@ -194,13 +201,16 @@ void MetalR1Module::forward(
     Buffer& type_to_active =
         m.upload("type_to_active", args.type_to_active, extents.type_to_active);
     Buffer& radius = m.upload_narrowed("radius", args.radius, edges);
-    Buffer& harmonics = m.upload("harmonics_values",
+    const DeviceSpan harmonics = m.staging->input("harmonics_values",
         static_cast<const float*>(args.harmonics_values), edges*s.edge_harmonics);
-    Buffer& features = m.upload("neighbor_features",
+    const DeviceSpan features = m.staging->input("neighbor_features",
         static_cast<const float*>(args.neighbor_features),
         extents.neighbor_feature_nodes*s.source_harmonics*channels);
     const std::size_t output_count = nodes*s.output_components*channels;
-    Buffer& output = m.slot("forward_output", output_count*sizeof(float));
+    float* phi1 = static_cast<float*>(args.output);
+    const DeviceSpan output = m.staging->output("forward_output", phi1, output_count);
+    // A staged Phi1 stays in its slot for a1_forward; mapped Phi1 needs no tag.
+    const bool phi1_staged = !m.staging->is_mapped(phi1, output_count*sizeof(float));
 
     const MetalR1ForwardArgs packet{
         args.active_type_count,
@@ -215,13 +225,14 @@ void MetalR1Module::forward(
         type_to_active.gpu_address(),
         radius.gpu_address(),
         m.spline(args.radial, batch),
-        harmonics.gpu_address(),
-        features.gpu_address(),
-        output.gpu_address()};
-    for (Buffer* buffer : {&node_types, &num_neigh, &first_neigh, &neigh_indices,
-            &neigh_types, &type_to_active, &radius, &harmonics, &features})
+        harmonics.address(),
+        features.address(),
+        output.address()};
+    for (const Buffer* buffer : std::initializer_list<const Buffer*>{&node_types, &num_neigh, &first_neigh,
+            &neigh_indices, &neigh_types, &type_to_active, &radius,
+            harmonics.buffer, features.buffer})
         batch.use_buffer(*buffer, false);
-    batch.use_buffer(output, true);
+    batch.use_buffer(*output.buffer, true);
     batch.set_value(0, packet)
         .dispatch_threads(m.forward, {nodes*channels}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
@@ -230,8 +241,9 @@ void MetalR1Module::forward(
     m.statistics.gpu_seconds += forward_seconds;
     m.statistics.forward_seconds += forward_seconds;
     const auto readback = Clock::now();
-    std::memcpy(args.output, output.contents(), output_count*sizeof(float));
-    m.phi1 = {args.output, output_count};
+    m.staging->complete();
+    if (phi1_staged)
+        m.phi1 = {args.output, output_count};
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.forward_launches;
 }
@@ -258,6 +270,7 @@ void MetalR1Module::reverse(
 
     const auto staging = Clock::now();
     auto batch = m.device.begin();
+    m.staging->begin();
     Buffer& node_types = m.upload("node_types", source.node_types, extents.node_types);
     Buffer& neigh_types = m.upload("neigh_types", source.neigh_types, edges);
     Buffer& type_to_active =
@@ -268,29 +281,28 @@ void MetalR1Module::reverse(
     Buffer& edge_receivers = m.upload("edge_receivers", source.edge_receivers, edges);
     Buffer& neigh_indices = m.upload("neigh_indices", edge.neigh_indices, edges);
     Buffer& radius = m.upload_narrowed("radius", source.radius, edges);
-    Buffer& harmonics = m.upload("harmonics_values",
+    const DeviceSpan harmonics = m.staging->input("harmonics_values",
         static_cast<const float*>(source.harmonics_values), edges*s.edge_harmonics);
     const std::size_t adjoint_elements =
         extents.receivers*s.output_components*channels;
-    Buffer* output_adjoint_buffer = nullptr;
+    DeviceSpan output_adjoint;
     if (m.phi1_adjoint.matches(source.output_adjoint, adjoint_elements)) {
-        output_adjoint_buffer = &m.slot("output_adjoint", adjoint_elements*sizeof(float));
+        output_adjoint = {&m.slot("output_adjoint", adjoint_elements*sizeof(float)), 0};
         ++m.statistics.resident_uploads_skipped;
     } else {
-        output_adjoint_buffer = &m.upload("output_adjoint",
+        output_adjoint = m.staging->input("output_adjoint",
             static_cast<const float*>(source.output_adjoint), adjoint_elements);
     }
     m.phi1_adjoint = {};
     m.phi1 = {};
-    Buffer& output_adjoint = *output_adjoint_buffer;
-    Buffer& features = m.upload("neighbor_features",
+    const DeviceSpan features = m.staging->input("neighbor_features",
         static_cast<const float*>(edge.neighbor_features),
         extents.neighbor_feature_nodes*s.source_harmonics*channels);
     // The source owner accumulates into the adjoint, so it starts from the
     // evaluator's current values.
     const std::size_t adjoint_count = sources*s.source_harmonics*channels;
-    Buffer& source_adjoint = m.upload("source_adjoint",
-        static_cast<const float*>(source.source_adjoint), adjoint_count);
+    const DeviceSpan source_adjoint = m.staging->output("source_adjoint",
+        static_cast<float*>(source.source_adjoint), adjoint_count, true);
 
     Buffer& unit_xyz = m.slot("unit_xyz", 3*edges*sizeof(float));
     float* unit = unit_xyz.data<float>();
@@ -339,9 +351,9 @@ void MetalR1Module::reverse(
         type_to_active.gpu_address(),
         radius.gpu_address(),
         radial,
-        harmonics.gpu_address(),
-        output_adjoint.gpu_address(),
-        source_adjoint.gpu_address()};
+        harmonics.address(),
+        output_adjoint.address(),
+        source_adjoint.address()};
     const MetalR1EdgeArgs edge_packet{
         edge.active_type_count,
         static_cast<std::uint32_t>(edges),
@@ -355,17 +367,17 @@ void MetalR1Module::reverse(
         unit_xyz.gpu_address(),
         radius.gpu_address(),
         m.spline(edge.radial, batch),
-        harmonics.gpu_address(),
+        harmonics.address(),
         gradients.gpu_address(),
-        features.gpu_address(),
-        output_adjoint.gpu_address(),
+        features.address(),
+        output_adjoint.address(),
         forces.gpu_address()};
-    for (Buffer* buffer : {&node_types, &neigh_types, &type_to_active,
+    for (const Buffer* buffer : std::initializer_list<const Buffer*>{&node_types, &neigh_types, &type_to_active,
             &source_offsets, &source_edges, &edge_receivers, &neigh_indices,
-            &radius, &harmonics, &output_adjoint, &features, &unit_xyz,
-            &gradients})
+            &radius, harmonics.buffer, output_adjoint.buffer, features.buffer,
+            &unit_xyz, &gradients})
         batch.use_buffer(*buffer, false);
-    batch.use_buffer(source_adjoint, true).use_buffer(forces, true);
+    batch.use_buffer(*source_adjoint.buffer, true).use_buffer(forces, true);
     if (sources != 0)
         batch.set_value(0, source_packet)
             .dispatch_threads(m.source, {sources*channels}, {threadgroup_size});
@@ -374,9 +386,9 @@ void MetalR1Module::reverse(
         m.statistics.gpu_seconds += source_seconds;
         m.statistics.source_seconds += source_seconds;
         batch = m.device.begin();
-        for (Buffer* buffer : {&node_types, &neigh_types, &type_to_active,
-                &edge_receivers, &neigh_indices, &radius, &harmonics,
-                &output_adjoint, &features, &unit_xyz, &gradients})
+        for (const Buffer* buffer : std::initializer_list<const Buffer*>{&node_types, &neigh_types, &type_to_active,
+                &edge_receivers, &neigh_indices, &radius, harmonics.buffer,
+                output_adjoint.buffer, features.buffer, &unit_xyz, &gradients})
             batch.use_buffer(*buffer, false);
         batch.use_buffer(forces, true);
         m.spline(edge.radial, batch);
@@ -406,8 +418,7 @@ void MetalR1Module::reverse(
     if (profiling_enabled())
         m.statistics.edge_seconds += edge_seconds;
     const auto readback = Clock::now();
-    std::memcpy(source.source_adjoint, source_adjoint.contents(),
-        adjoint_count*sizeof(float));
+    m.staging->complete();
     // The edge kernel subtracts from zero; the evaluator's directed forces
     // receive the same contribution in double precision.
     const float* force_values = forces.data<float>();
@@ -435,15 +446,21 @@ bool MetalR1Module::a1_forward(
     Impl::validate(layout, *m.staging);
     const std::size_t channels = static_cast<std::size_t>(m.shape.channels);
     const std::size_t phi1_count = num_nodes*layout.num_lme*channels;
-    if (num_nodes == 0 || !m.phi1.matches(phi1, phi1_count))
+    const bool phi1_resident = m.phi1.matches(phi1, phi1_count);
+    if (num_nodes == 0
+            || !(phi1_resident
+                || m.staging->is_mapped(phi1, phi1_count*sizeof(float))))
         return false;
     checked_u32(static_cast<std::int64_t>(num_nodes), "A1 node count");
     const auto rows = static_cast<std::uint32_t>(num_nodes);
     const auto c = static_cast<std::uint32_t>(channels);
     auto batch = m.device.begin();
-    Buffer& input = m.slot("forward_output", phi1_count*sizeof(float));
+    m.staging->begin();
+    const DeviceSpan input = phi1_resident
+        ? DeviceSpan{&m.slot("forward_output", phi1_count*sizeof(float)), 0}
+        : m.staging->input("phi1", phi1, phi1_count);
     const std::size_t output_count = num_nodes*layout.num_lm*channels;
-    Buffer& output = m.slot("a1_output", output_count*sizeof(float));
+    const DeviceSpan output = m.staging->output("a1_output", a1, output_count);
     const std::size_t input_row = layout.num_lme*channels*sizeof(float);
     const std::size_t output_row = layout.num_lm*channels*sizeof(float);
     for (int l = 0; l <= layout.l_max; ++l) {
@@ -454,17 +471,19 @@ bool MetalR1Module::a1_forward(
             layout.weights[l], static_cast<std::size_t>(inputs)*channels*sizeof(float));
         for (int row = 0; row < 2*l+1; ++row)
             batch.gemm(
-                {&input, (layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
+                {input.buffer, input.offset
+                    +(layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
                     *sizeof(float), rows, inputs, input_row},
                 {&weights, 0, inputs, c, channels*sizeof(float)},
-                {&output, (static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
+                {output.buffer, output.offset
+                    +(static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
                     rows, c, output_row});
     }
     const double a1_seconds = batch.submit_and_wait().gpu_seconds;
     m.statistics.gpu_seconds += a1_seconds;
     m.statistics.a1_seconds += a1_seconds;
     const auto readback = Clock::now();
-    std::memcpy(a1, output.contents(), output_count*sizeof(float));
+    m.staging->complete();
     // Degrees without paths contribute zero rows, as the zero-depth host GEMM.
     for (int l = 0; l <= layout.l_max; ++l)
         if (layout.eta[l] == 0)
@@ -493,13 +512,19 @@ void MetalR1Module::a1_reverse(
     const auto c = static_cast<std::uint32_t>(channels);
     const auto staging = Clock::now();
     auto batch = m.device.begin();
-    Buffer& input = m.upload("a1_adjoint", a1_adjoint,
+    m.staging->begin();
+    const DeviceSpan input = m.staging->input("a1_adjoint", a1_adjoint,
         num_nodes*layout.num_lm*channels);
     const std::size_t output_count = num_nodes*layout.num_lme*channels;
     const std::size_t capacity_count = capacity_nodes*layout.num_lme*channels;
-    // Written into the R1 reverse input slot, sized as the reverse stages
-    // it, so the next reverse reuses it without a reallocation.
-    Buffer& output = m.slot("output_adjoint", capacity_count*sizeof(float));
+    // Mapped dPhi1 is written in place. Otherwise it is written into the R1
+    // reverse input slot, sized as the reverse stages it, so the next
+    // reverse reuses it without a reallocation or upload.
+    const bool phi1_adjoint_mapped =
+        m.staging->is_mapped(phi1_adjoint, output_count*sizeof(float));
+    const DeviceSpan output = phi1_adjoint_mapped
+        ? m.staging->output("output_adjoint", phi1_adjoint, output_count)
+        : DeviceSpan{&m.slot("output_adjoint", capacity_count*sizeof(float)), 0};
     const std::size_t input_row = layout.num_lm*channels*sizeof(float);
     const std::size_t output_row = layout.num_lme*channels*sizeof(float);
     for (int l = 0; l <= layout.l_max; ++l) {
@@ -511,10 +536,12 @@ void MetalR1Module::a1_reverse(
             static_cast<std::size_t>(inputs)*channels*sizeof(float));
         for (int row = 0; row < 2*l+1; ++row)
             batch.gemm(
-                {&input, (static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
+                {input.buffer, input.offset
+                    +(static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
                     rows, c, input_row},
                 {&weights_trans, 0, c, inputs, inputs*sizeof(float)},
-                {&output, (layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
+                {output.buffer, output.offset
+                    +(layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
                     *sizeof(float), rows, inputs, output_row});
     }
     m.statistics.staging_seconds += seconds_since(staging);
@@ -522,8 +549,13 @@ void MetalR1Module::a1_reverse(
     m.statistics.gpu_seconds += a1_seconds;
     m.statistics.a1_seconds += a1_seconds;
     const auto readback = Clock::now();
-    std::memcpy(phi1_adjoint, output.contents(), output_count*sizeof(float));
-    m.phi1_adjoint = {phi1_adjoint, capacity_count};
+    m.staging->complete();
+    if (phi1_adjoint_mapped) {
+        m.phi1_adjoint = {};
+    } else {
+        std::memcpy(phi1_adjoint, output.buffer->contents(), output_count*sizeof(float));
+        m.phi1_adjoint = {phi1_adjoint, capacity_count};
+    }
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.a1_reverse_launches;
 }

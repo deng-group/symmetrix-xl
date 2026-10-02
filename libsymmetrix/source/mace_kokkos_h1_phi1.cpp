@@ -32,6 +32,7 @@
 #include "mace_kokkos.hpp"
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_r1_module.hpp"
+#include "metal_view_registry.hpp"
 #endif
 #include "cblas.hpp"
 #include "device_backend.hpp"
@@ -1535,6 +1536,9 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
 #ifdef SYMMETRIX_ENABLE_METAL
                 if constexpr (std::is_same_v<Precision, float>) {
                     if (metal_r1_module) {
+                        metal_views->map(Y);
+                        metal_views->map(H1);
+                        metal_views->map(Phi1);
                         metal_r1_module->forward(args, {
                             node_types.extent(0),
                             type_to_active.extent(0),

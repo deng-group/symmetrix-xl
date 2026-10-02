@@ -33,6 +33,7 @@
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_m0_module.hpp"
 #include "metal_r0_module.hpp"
+#include "metal_view_registry.hpp"
 #endif
 #include "device_backend.hpp"
 #include "mace_kokkos_jit_plugin_detail.hpp"
@@ -207,6 +208,22 @@ void MACEKokkos<Precision>::compute_Y(
             r, Kokkos::make_pair(
                 static_cast<std::size_t>(edge_begin),
                 static_cast<std::size_t>(edge_begin)+num_edges));
+#ifdef SYMMETRIX_ENABLE_METAL
+        if constexpr (std::is_same_v<Precision, float>) {
+            // Every Y consumer runs on the GPU; Y is written in place.
+            if (metal_r0_module && compact_geometry && edge_begin == 0) {
+                execution_space.fence();
+                metal_views->map(execution_prepared_unit_direction);
+                metal_views->map(Y);
+                metal_r0_module->harmonic_values(
+                    num_edges, harmonics, r_cut,
+                    execution_prepared_unit_direction.data(), r.data(), Y.data());
+                if (num > 0)
+                    execution_direct_harmonic_launch_count += 1;
+                return;
+            }
+        }
+#endif
         if (compact_geometry) {
             const auto active_direction = Kokkos::subview(
                 execution_prepared_unit_direction,
@@ -666,6 +683,8 @@ void MACEKokkos<Precision>::compute_A0_streamed(
             if (metal_r0_module && workspace_edge_begin == 0
                     && Y.extent(0) >= r.extent(0)*A0.extent(1)) {
                 execution_space.fence();
+                metal_views->map(Y);
+                metal_views->map(A0);
                 metal_r0_module->forward(
                 symmetrix::execution::metal::MetalR0Graph{
                     num_nodes, num_active_types, r_cut,
@@ -846,6 +865,7 @@ void MACEKokkos<Precision>::metal_r0_coordinate_reverse(
     if constexpr (std::is_same_v<Precision, float>) {
         const std::size_t edges = r.extent(0);
         execution_space.fence();
+        metal_views->map(A0_adj);
         using CoordinateScalar = typename CoordinateView::non_const_value_type;
         metal_r0_module->coordinate_reverse(
             symmetrix::execution::metal::MetalR0Graph{
@@ -1549,6 +1569,8 @@ void MACEKokkos<Precision>::compute_M0_module(
             if constexpr (std::is_same_v<Precision, float>) {
                 if (metal_m0_module) {
                     execution_space.fence();
+                    metal_views->map(A0);
+                    metal_views->map(M0);
                     metal_m0_module->forward(
                         num_nodes, node_types.data(), A0.data(),
                         standard_m0_module_weights.data(),
@@ -1654,6 +1676,9 @@ void MACEKokkos<Precision>::launch_M0_module_reverse(
             if constexpr (std::is_same_v<Precision, float>) {
                 if (metal_m0_module) {
                     execution_space.fence();
+                    metal_views->map(input);
+                    metal_views->map(output_adjoint);
+                    metal_views->map(input_adjoint);
                     metal_m0_module->reverse(
                         num_nodes, node_types.data(), input.data(),
                         standard_m0_module_weights.data(),

@@ -123,14 +123,14 @@ def omat_small_model():
             os.environ["XDG_CACHE_HOME"] = previous
 
 
-def _strontium_titanate():
+def _strontium_titanate(repeat=2):
     a = 3.905
     atoms = crystal(
         ["Sr", "Ti", "O"],
         basis=[(0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0)],
         spacegroup=221,
         cellpar=[a, a, a, 90, 90, 90],
-    ).repeat((2, 2, 2))
+    ).repeat((repeat,) * 3)
     atoms.rattle(stdev=0.05, seed=3)
     return atoms
 
@@ -161,14 +161,18 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     assert statistics["r0_forward_launches"] >= 1
     assert statistics["r0_reverse_launches"] >= 1
     assert statistics["r0_gpu_seconds"] > 0.0
+    assert statistics["r0_harmonic_launches"] >= 1
     assert statistics["m0_forward_launches"] >= 1
     assert statistics["m0_reverse_launches"] >= 1
     assert statistics["m1_forward_launches"] >= 1
     assert statistics["m1_reverse_launches"] >= 1
     assert statistics["a1_forward_launches"] >= 1
     assert statistics["a1_reverse_launches"] >= 1
-    # dPhi1 produced by the A1 reverse is consumed on the GPU by R1.
-    assert statistics["resident_uploads_skipped"] >= 1
+    # Evaluator views are mapped for in-place GPU access; unmapped Phi1
+    # adjoints stay resident between the A1 and R1 passes instead.
+    assert (
+        statistics["mapped_views"] >= 1 or statistics["resident_uploads_skipped"] >= 1
+    )
     # The evaluator's edge list is receiver-ordered, so the channel-blocked
     # edge kernel runs.
     assert statistics["blocked_edge_launches"] >= 1
@@ -177,3 +181,20 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     assert abs(e_metal - e_host) / len(atoms) < 1e-5
     np.testing.assert_allclose(f_metal, f_host, atol=1e-4)
     np.testing.assert_allclose(s_metal, s_host, atol=1e-5)
+
+
+def test_metal_mapped_views_follow_reallocation(omat_small_model):
+    from symmetrix import Symmetrix
+
+    species = [8, 22, 38]
+    host = Symmetrix(omat_small_model, species=species, dtype="float32")
+    metal = Symmetrix(omat_small_model, species=species, dtype="float32", metal=True)
+    # Growing, shrinking, and regrowing the system reallocates evaluator views
+    # between evaluations; mapped allocations must follow without stale wraps.
+    for repeat in (3, 2, 4, 3):
+        atoms = _strontium_titanate(repeat)
+        e_host, f_host, _ = _evaluate(atoms, host)
+        e_metal, f_metal, _ = _evaluate(atoms, metal)
+        assert abs(e_metal - e_host) / len(atoms) < 1e-5
+        np.testing.assert_allclose(f_metal, f_host, atol=1e-4)
+    assert metal.metal_statistics()["mapped_views"] >= 1

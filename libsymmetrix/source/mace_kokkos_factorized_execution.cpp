@@ -32,6 +32,7 @@
 #include "mace_kokkos.hpp"
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_r1_module.hpp"
+#include "metal_view_registry.hpp"
 #endif
 #include "device_backend.hpp"
 #include "factorized_blas.hpp"
@@ -1051,6 +1052,10 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
 #ifdef SYMMETRIX_ENABLE_METAL
                 if constexpr (std::is_same_v<Precision, float>) {
                     if (metal_r1_module) {
+                        metal_views->map(Y);
+                        metal_views->map(H1);
+                        metal_views->map(dPhi1);
+                        metal_views->map(H1_adj);
                         metal_r1_module->reverse(source_args, edge_args, {
                             node_types.extent(0),
                             type_to_active.extent(0),

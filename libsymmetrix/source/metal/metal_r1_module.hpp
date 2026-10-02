@@ -15,6 +15,8 @@
 
 namespace symmetrix::execution::metal {
 
+class HostMemoryMap;
+
 struct MetalR1Shape {
     std::int32_t channels = 0;
     std::int32_t edge_harmonics = 0;
@@ -78,6 +80,9 @@ public:
     const MetalR1Shape& shape() const;
     const std::string& device_name() const;
     const MetalR1Statistics& statistics() const;
+
+    // Host ranges in this map are read and written in place.
+    void set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory);
 
     void forward(
         const SymmetrixJitHostR1ForwardArgsV2& args,

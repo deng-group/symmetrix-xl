@@ -41,6 +41,7 @@
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_m0_module.hpp"
 #include "metal_r0_module.hpp"
+#include "metal_view_registry.hpp"
 #include "metal_r1_module.hpp"
 #endif
 #include "kernel_launch_profile.hpp"
@@ -1384,6 +1385,7 @@ void MACEKokkos<Precision>::load_metal_r1_module(
                 symmetrix::execution::metal::MetalR1Shape{
                     channels, edge_harmonics, source_harmonics,
                     output_components});
+        metal_r1_module->set_host_memory(ensure_metal_views());
     }
 #else
     (void)source;
@@ -1395,6 +1397,18 @@ void MACEKokkos<Precision>::load_metal_r1_module(
         "This Symmetrix build does not include Metal support.");
 #endif
 }
+
+#ifdef SYMMETRIX_ENABLE_METAL
+template <typename Precision>
+std::shared_ptr<const symmetrix::execution::metal::HostMemoryMap>
+MACEKokkos<Precision>::ensure_metal_views()
+{
+    if (!metal_views)
+        metal_views = std::make_shared<symmetrix::execution::metal::MetalViewRegistry>(
+            symmetrix::execution::metal::Device::system_default());
+    return metal_views->host_memory();
+}
+#endif
 
 template <typename Precision>
 void MACEKokkos<Precision>::clear_metal_r1_module()
@@ -1416,8 +1430,11 @@ void MACEKokkos<Precision>::load_metal_r0_module()
         throw std::invalid_argument(
             "Metal R0 execution supports FP32 evaluators only.");
     else
+    {
         metal_r0_module =
             std::make_shared<symmetrix::execution::metal::MetalR0Module>();
+        metal_r0_module->set_host_memory(ensure_metal_views());
+    }
 #else
     throw std::runtime_error(
         "This Symmetrix build does not include Metal support.");
@@ -1451,6 +1468,7 @@ void MACEKokkos<Precision>::load_metal_m0_module(
                 source,
                 symmetrix::execution::metal::MetalM0Shape{
                     channels, input_components, output_components, term_count});
+        metal_m0_module->set_host_memory(ensure_metal_views());
     }
 #else
     (void)source;
@@ -1491,6 +1509,7 @@ void MACEKokkos<Precision>::load_metal_m1_module(
                 source,
                 symmetrix::execution::metal::MetalM0Shape{
                     channels, input_components, output_components, term_count});
+        metal_m1_module->set_host_memory(ensure_metal_views());
     }
 #else
     (void)source;
@@ -1543,6 +1562,8 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["r0_forward_seconds"] = statistics.forward_seconds;
         values["r0_reverse_seconds"] = statistics.reverse_seconds;
         values["r0_harmonics_seconds"] = statistics.harmonics_seconds;
+        values["r0_harmonic_launches"] =
+            static_cast<double>(statistics.harmonic_launches);
     }
     if (metal_r1_module) {
         const auto& statistics = metal_r1_module->statistics();
@@ -1565,6 +1586,8 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["blocked_edge_launches"] =
             static_cast<double>(statistics.blocked_edge_launches);
     }
+    if (metal_views)
+        values["mapped_views"] = static_cast<double>(metal_views->size());
 #endif
     return values;
 }
