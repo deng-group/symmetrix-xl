@@ -326,6 +326,11 @@ if(_symmetrix_host_arch_flag
         $<$<COMPILE_LANGUAGE:CXX>:${_symmetrix_host_arch_flag}>)
 endif()
 
+# The standard M0 term folds expand to several hundred operands, beyond the
+# default 256-level nesting limit of older Clang releases (Xcode 16).
+target_compile_options(symmetrix PUBLIC
+    $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-fbracket-depth=1024>)
+
 target_include_directories(symmetrix
     PUBLIC  source
             "${CMAKE_CURRENT_SOURCE_DIR}/../symmetrix/source/symmetrix"
