@@ -818,21 +818,14 @@ void MACEKokkos<Precision>::compute_A0_streamed(
 template <typename Precision>
 bool MACEKokkos<Precision>::metal_r0_reverse_admitted(
     const int receiver_base,
-    const int edge_begin,
-    Kokkos::View<const double*> r) const
+    const int edge_begin) const
 {
 #ifdef SYMMETRIX_ENABLE_METAL
-    const std::size_t harmonics = static_cast<std::size_t>(num_lm);
-    const bool gradients_available = Y_grad.data() != nullptr
-        ? Y_grad.extent(0) >= 3*r.extent(0)*harmonics
-        : num_lm == symmetrix::standard_r0::harmonic_count;
     return metal_r0_module && receiver_base == 0 && edge_begin == 0
-        && !single_layer_tiled_plan_active && !dual_layer_tiled_plan_active
-        && Y.extent(0) >= r.extent(0)*harmonics && gradients_available;
+        && !single_layer_tiled_plan_active && !dual_layer_tiled_plan_active;
 #else
     (void)receiver_base;
     (void)edge_begin;
-    (void)r;
     return false;
 #endif
 }
@@ -852,34 +845,7 @@ void MACEKokkos<Precision>::metal_r0_coordinate_reverse(
 #ifdef SYMMETRIX_ENABLE_METAL
     if constexpr (std::is_same_v<Precision, float>) {
         const std::size_t edges = r.extent(0);
-        constexpr int harmonic_count = symmetrix::standard_r0::harmonic_count;
         execution_space.fence();
-        const Precision* gradients = Y_grad.data();
-        if (gradients == nullptr) {
-            // The host owner recomputes l_max=3 gradients per edge; Metal
-            // receives the same values precomputed in [3, 16] edge blocks.
-            if (metal_r0_gradients.extent(0) < 3*harmonic_count*edges)
-                Kokkos::realloc(metal_r0_gradients, 3*harmonic_count*edges);
-            const auto out = metal_r0_gradients;
-            Kokkos::parallel_for(
-                "MetalR0::harmonic_gradients",
-                Kokkos::RangePolicy<ExecutionSpace,
-                    Kokkos::IndexType<std::size_t>>(execution_space, 0, edges),
-                KOKKOS_LAMBDA (const std::size_t edge) {
-                    const Precision direction[3] = {
-                        symmetrix::standard_r0::direction_component<Precision>(
-                            coordinates, r, edge, 0, coordinates_are_unit),
-                        symmetrix::standard_r0::direction_component<Precision>(
-                            coordinates, r, edge, 1, coordinates_are_unit),
-                        symmetrix::standard_r0::direction_component<Precision>(
-                            coordinates, r, edge, 2, coordinates_are_unit)};
-                    symmetrix::normalized_spherical_harmonic_gradients_from_direction<3>(
-                        direction, static_cast<Precision>(r(edge)),
-                        out.data()+3*harmonic_count*edge);
-                });
-            execution_space.fence();
-            gradients = metal_r0_gradients.data();
-        }
         using CoordinateScalar = typename CoordinateView::non_const_value_type;
         metal_r0_module->coordinate_reverse(
             symmetrix::execution::metal::MetalR0Graph{
@@ -899,8 +865,6 @@ void MACEKokkos<Precision>::metal_r0_coordinate_reverse(
             coordinates.data(),
             static_cast<std::uint32_t>(sizeof(CoordinateScalar)),
             coordinates_are_unit,
-            Y.data(),
-            gradients,
             A0_adj.data(),
             node_forces.data());
         if (A0_scaled) {
@@ -1132,8 +1096,7 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
             default:
 #ifdef SYMMETRIX_ENABLE_METAL
                 if constexpr (std::is_same_v<Precision, float>) {
-                    if (metal_r0_reverse_admitted(
-                            receiver_base, edge_begin, r)) {
+                    if (metal_r0_reverse_admitted(receiver_base, edge_begin)) {
                         metal_r0_coordinate_reverse(
                             execution_space, num_nodes, node_types,
                             num_neigh, neigh_types, coordinates,

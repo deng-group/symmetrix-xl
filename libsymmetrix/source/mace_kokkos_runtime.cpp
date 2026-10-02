@@ -1540,6 +1540,9 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
             static_cast<double>(statistics.reverse_launches);
         values["r0_gpu_seconds"] = statistics.gpu_seconds;
         values["r0_staging_seconds"] = statistics.staging_seconds;
+        values["r0_forward_seconds"] = statistics.forward_seconds;
+        values["r0_reverse_seconds"] = statistics.reverse_seconds;
+        values["r0_harmonics_seconds"] = statistics.harmonics_seconds;
     }
     if (metal_r1_module) {
         const auto& statistics = metal_r1_module->statistics();

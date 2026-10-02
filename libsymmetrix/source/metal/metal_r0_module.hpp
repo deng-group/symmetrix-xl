@@ -43,6 +43,11 @@ struct MetalR0Statistics {
     std::uint64_t reverse_launches = 0;
     double gpu_seconds = 0.0;
     double staging_seconds = 0.0;
+    double forward_seconds = 0.0;
+    double reverse_seconds = 0.0;
+    // Harmonic pass of the reverse, timed separately only when
+    // SYMMETRIX_METAL_PROFILE=1 splits it into its own submission.
+    double harmonics_seconds = 0.0;
 };
 
 class MetalR0Module {
@@ -68,6 +73,7 @@ public:
     // Adds the radial and angular coordinate adjoint of every edge to
     // directed_forces[3*edge + k]. Unit directions follow the evaluator's
     // geometry policy: FP32 unit vectors, FP64 unit vectors, or FP64 vectors.
+    // The kernel evaluates the harmonics and their gradients itself.
     void coordinate_reverse(
         const MetalR0Graph& graph,
         const MetalR0Spline& spline,
@@ -76,8 +82,6 @@ public:
         const void* coordinates,
         std::uint32_t coordinate_scalar_size,
         bool coordinates_are_unit,
-        const float* harmonics,
-        const float* harmonic_gradients,
         const float* output_adjoint,
         double* directed_forces);
 

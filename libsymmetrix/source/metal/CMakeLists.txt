@@ -17,8 +17,39 @@ endif()
 
 option(SYMMETRIX_METAL_SELFTEST "Build the Metal runtime self-test executable." ON)
 
+# Metal kernels compile SpheriCart's hardcoded spherical-harmonic macros at
+# runtime; embed the macro block so they share the host polynomial source.
+if(DEFINED SYMMETRIX_SPHERICART_SOURCE_DIR)
+    set(_symmetrix_metal_sphericart "${SYMMETRIX_SPHERICART_SOURCE_DIR}")
+else()
+    set(_symmetrix_metal_sphericart
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../external/sphericart")
+endif()
+set(_symmetrix_metal_sphericart_macros
+    "${_symmetrix_metal_sphericart}/sphericart/include/macros.hpp")
+file(READ "${_symmetrix_metal_sphericart_macros}" _symmetrix_metal_macros_text)
+string(FIND "${_symmetrix_metal_macros_text}" "#define COMPUTE_SPH_L0"
+    _symmetrix_metal_macros_begin)
+string(FIND "${_symmetrix_metal_macros_text}" "#endif"
+    _symmetrix_metal_macros_end REVERSE)
+if(_symmetrix_metal_macros_begin EQUAL -1
+        OR _symmetrix_metal_macros_end LESS _symmetrix_metal_macros_begin)
+    message(FATAL_ERROR
+        "Unrecognized SpheriCart macro layout in ${_symmetrix_metal_sphericart_macros}")
+endif()
+math(EXPR _symmetrix_metal_macros_length
+    "${_symmetrix_metal_macros_end}-${_symmetrix_metal_macros_begin}")
+string(SUBSTRING "${_symmetrix_metal_macros_text}" ${_symmetrix_metal_macros_begin}
+    ${_symmetrix_metal_macros_length} SYMMETRIX_METAL_SPHERICART_MACROS)
+configure_file(metal_sphericart_macros.hpp.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/metal_sphericart_macros.hpp" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_symmetrix_metal_sphericart_macros}")
+
 add_library(symmetrix_metal STATIC
     metal_runtime.mm metal_m0_module.cpp metal_r0_module.cpp metal_r1_module.cpp)
+target_include_directories(symmetrix_metal
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set_target_properties(symmetrix_metal PROPERTIES
     OBJCXX_STANDARD 20
     OBJCXX_STANDARD_REQUIRED ON

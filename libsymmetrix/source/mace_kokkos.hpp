@@ -161,8 +161,7 @@ bool metal_m1_module_ready() const;
 // Fills the per-degree A1 layout consumed by the Metal R1 module; returns
 // false when the model's A1 blocks fall outside its supported shape.
 bool metal_a1_layout(void* layout) const;
-bool metal_r0_reverse_admitted(
-    int receiver_base, int edge_begin, Kokkos::View<const double*> r) const;
+bool metal_r0_reverse_admitted(int receiver_base, int edge_begin) const;
 template <class ExecutionSpace, class CoordinateView>
 void metal_r0_coordinate_reverse(
     const ExecutionSpace& execution_space,
@@ -1108,8 +1107,6 @@ std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
 std::shared_ptr<symmetrix::execution::metal::MetalR0Module> metal_r0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m1_module;
-// Harmonic gradients recomputed for Metal R0 when Y_grad is not retained.
-Kokkos::View<Precision*> metal_r0_gradients;
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =

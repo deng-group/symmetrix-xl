@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <stdexcept>
 
 #include "metal_runtime.hpp"
+#include "metal_spherical_harmonics.hpp"
 #include "metal_staging.hpp"
 
 namespace symmetrix::execution::metal {
@@ -17,7 +19,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr std::uint64_t threadgroup_size = 128;
 constexpr std::uint64_t simd_width = 32;
-constexpr std::int32_t max_harmonics = 16;
+constexpr std::int32_t max_degree = 3;
 
 // Device pointers are 64-bit GPU addresses; the scalar header is 48 bytes so
 // the pointer block starts 8-byte aligned in both layouts.
@@ -45,13 +47,14 @@ struct R0Args {
     std::uint64_t harmonics;
     std::uint64_t density_scale;
     std::uint64_t unit_xyz;
-    std::uint64_t gradients;
+    std::uint64_t harmonics_out;
+    std::uint64_t gradients_out;
     std::uint64_t adjoint;
     std::uint64_t output;
 };
-static_assert(sizeof(R0Args) == 160);
+static_assert(sizeof(R0Args) == 168);
 
-constexpr const char* r0_source = R"MSL(
+constexpr const char* r0_kernels = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -79,7 +82,8 @@ struct R0Args {
     device const float* harmonics;
     device const float* density_scale;
     device const float* unit_xyz;
-    device const float* gradients;
+    device float* harmonics_out;
+    device float* gradients_out;
     device const float* adjoint;
     device float* output;
 };
@@ -155,6 +159,37 @@ kernel void symmetrix_r0_forward(
             accumulator[lm] * scale;
 }
 
+// One thread evaluates the harmonics and Cartesian gradients of one edge
+// into GPU-only buffers laid out as the host owner's Y and Y_grad blocks.
+template <uint L>
+kernel void symmetrix_r0_harmonics(
+    constant R0Args& a [[buffer(0)]],
+    uint edge [[thread_position_in_grid]])
+{
+    constexpr uint size = (L + 1) * (L + 1);
+    if (edge >= a.num_edges)
+        return;
+    const float3 u = float3(
+        a.unit_xyz[3 * edge], a.unit_xyz[3 * edge + 1], a.unit_xyz[3 * edge + 2]);
+    float values[size];
+    float gradients[3 * size];
+    symmetrix_sph_values_gradients<int(L)>(u, a.radius[edge], values, gradients);
+    device float* Y = a.harmonics_out + ulong(edge) * size;
+    device float* G = a.gradients_out + ulong(edge) * 3 * size;
+    for (uint index = 0; index < size; ++index)
+        Y[index] = values[index];
+    for (uint index = 0; index < 3 * size; ++index)
+        G[index] = gradients[index];
+}
+
+#define SYMMETRIX_R0_HARMONICS(L) \
+    template [[host_name("symmetrix_r0_harmonics_l" #L)]] kernel void \
+    symmetrix_r0_harmonics<L>(constant R0Args&, uint);
+SYMMETRIX_R0_HARMONICS(0)
+SYMMETRIX_R0_HARMONICS(1)
+SYMMETRIX_R0_HARMONICS(2)
+SYMMETRIX_R0_HARMONICS(3)
+
 // One 32-lane SIMD group owns one edge; lanes split the channels so adjoint
 // and spline loads coalesce, and simd_sum reduces the force components.
 kernel void symmetrix_r0_reverse(
@@ -180,6 +215,8 @@ kernel void symmetrix_r0_reverse(
     const ulong harmonic_offset = ulong(edge) * a.harmonic_count;
     const ulong gradient_offset = 3 * harmonic_offset;
     const ulong adjoint_offset = ulong(receiver) * a.harmonic_count;
+    device const float* Y = a.harmonics_out;
+    device const float* G = a.gradients_out;
     float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     for (uint channel = lane; channel < a.channels; channel += 32u) {
         for (uint l = 0; l < degrees; ++l) {
@@ -192,13 +229,13 @@ kernel void symmetrix_r0_reverse(
             for (uint lm = l * l; lm < (l + 1) * (l + 1); ++lm) {
                 const float adjoint =
                     a.adjoint[(adjoint_offset + lm) * a.channels + channel];
-                const float radial = derivative * a.harmonics[harmonic_offset + lm] * adjoint;
+                const float radial = derivative * Y[harmonic_offset + lm] * adjoint;
                 const float angular = value * adjoint;
-                fx += radial * ux + angular * a.gradients[gradient_offset + lm];
+                fx += radial * ux + angular * G[gradient_offset + lm];
                 fy += radial * uy
-                    + angular * a.gradients[gradient_offset + a.harmonic_count + lm];
+                    + angular * G[gradient_offset + a.harmonic_count + lm];
                 fz += radial * uz
-                    + angular * a.gradients[gradient_offset + 2 * a.harmonic_count + lm];
+                    + angular * G[gradient_offset + 2 * a.harmonic_count + lm];
             }
         }
     }
@@ -213,6 +250,12 @@ kernel void symmetrix_r0_reverse(
 }
 )MSL";
 
+bool profiling_enabled()
+{
+    const char* value = std::getenv("SYMMETRIX_METAL_PROFILE");
+    return value != nullptr && std::string(value) == "1";
+}
+
 double seconds_since(const Clock::time_point start)
 {
     return std::chrono::duration<double>(Clock::now()-start).count();
@@ -224,6 +267,8 @@ struct MetalR0Module::Impl {
     Device device;
     Pipeline forward;
     Pipeline reverse;
+    // Indexed by l_max; harmonics are compile-time sized per pipeline.
+    Pipeline harmonics[max_degree+1];
     std::unique_ptr<MetalStaging> staging;
     MetalR0Statistics statistics;
 
@@ -232,22 +277,26 @@ struct MetalR0Module::Impl {
         staging->fail(message);
     }
 
+    static int degree_of(const std::int32_t harmonic_count)
+    {
+        for (int l = 0; l <= max_degree; ++l)
+            if ((l+1)*(l+1) == harmonic_count)
+                return l;
+        return -1;
+    }
+
     void validate(const MetalR0Graph& graph, const MetalR0Spline& spline,
         const std::int32_t channels, const std::int32_t harmonic_count) const
     {
         if (graph.num_nodes < 0 || channels <= 0)
             fail("graph extents must be nonnegative and channels positive");
-        if (harmonic_count <= 0 || harmonic_count > max_harmonics)
-            fail("R0 supports l_max from 0 through 3");
+        if (degree_of(harmonic_count) < 0)
+            fail("R0 supports (l_max+1)^2 harmonics for l_max from 0 through 3");
         if (spline.coefficients == nullptr || spline.intervals == 0
                 || spline.functions == 0 || spline.edge_types == 0)
             fail("R0 spline coefficients are empty");
-        const std::size_t degrees = [&] {
-            std::size_t l = 0;
-            while ((l+1)*(l+1) < static_cast<std::size_t>(harmonic_count))
-                ++l;
-            return l+1;
-        }();
+        const std::size_t degrees =
+            static_cast<std::size_t>(degree_of(harmonic_count))+1;
         if (spline.functions != degrees*static_cast<std::size_t>(channels))
             fail("R0 spline functions do not match the channel layout");
         if (static_cast<std::size_t>(graph.active_type_count)
@@ -302,12 +351,18 @@ MetalR0Module::MetalR0Module() : impl_(std::make_unique<Impl>())
 {
     impl_->device = Device::system_default();
     impl_->staging = std::make_unique<MetalStaging>(impl_->device, "R0");
-    const Library library = impl_->device.compile(r0_source, module_compile_options());
+    const Library library = impl_->device.compile(
+        spherical_harmonics_msl()+r0_kernels, module_compile_options());
     impl_->forward = impl_->device.pipeline(library, "symmetrix_r0_forward");
     impl_->reverse = impl_->device.pipeline(library, "symmetrix_r0_reverse");
     if (impl_->reverse.thread_execution_width() != simd_width)
         impl_->fail("the reverse kernel requires 32-wide SIMD groups");
-    for (const Pipeline* pipeline : {&impl_->forward, &impl_->reverse})
+    for (int l = 0; l <= max_degree; ++l)
+        impl_->harmonics[l] = impl_->device.pipeline(
+            library, "symmetrix_r0_harmonics_l"+std::to_string(l));
+    for (const Pipeline* pipeline : {&impl_->forward, &impl_->reverse,
+            &impl_->harmonics[0], &impl_->harmonics[1], &impl_->harmonics[2],
+            &impl_->harmonics[3]})
         if (pipeline->max_total_threads_per_threadgroup() < threadgroup_size)
             impl_->fail("pipeline '"+pipeline->function_name()
                 +"' cannot run the required threadgroup size");
@@ -356,7 +411,9 @@ void MetalR0Module::forward(
     batch.set_value(0, args)
         .dispatch_threads(m.forward, {nodes*channels}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
-    m.statistics.gpu_seconds += batch.submit_and_wait().gpu_seconds;
+    const double gpu_seconds = batch.submit_and_wait().gpu_seconds;
+    m.statistics.gpu_seconds += gpu_seconds;
+    m.statistics.forward_seconds += gpu_seconds;
     const auto readback = Clock::now();
     std::memcpy(output, out.contents(), output_count*sizeof(float));
     m.statistics.staging_seconds += seconds_since(readback);
@@ -371,15 +428,11 @@ void MetalR0Module::coordinate_reverse(
     const void* coordinates,
     const std::uint32_t coordinate_scalar_size,
     const bool coordinates_are_unit,
-    const float* harmonics,
-    const float* harmonic_gradients,
     const float* output_adjoint,
     double* directed_forces)
 {
     auto& m = *impl_;
     m.validate(graph, spline, channels, harmonic_count);
-    if (harmonic_gradients == nullptr)
-        m.fail("R0 coordinate reverse requires harmonic gradients");
     const std::size_t nodes = static_cast<std::size_t>(graph.num_nodes);
     const std::size_t edges = graph.edge_capacity;
     if (nodes == 0 || edges == 0)
@@ -415,27 +468,44 @@ void MetalR0Module::coordinate_reverse(
                 unit_xyz[3*edge+k] = static_cast<float>(coordinates_are_unit
                     ? xyz[3*edge+k] : xyz[3*edge+k]/graph.radius[edge]);
     }
+    // GPU-only harmonic workspaces; no host storage or transfer.
     const std::size_t harmonic_values = edges*static_cast<std::size_t>(harmonic_count);
-    Buffer& Y = m.staging->upload("harmonics", harmonics, harmonic_values);
-    Buffer& gradients =
-        m.staging->upload("gradients", harmonic_gradients, 3*harmonic_values);
+    Buffer& Y = m.staging->slot("harmonics", harmonic_values*sizeof(float));
+    Buffer& gradients = m.staging->slot("gradients", 3*harmonic_values*sizeof(float));
     Buffer& adjoint = m.staging->upload("adjoint", output_adjoint,
         nodes*static_cast<std::size_t>(harmonic_count)*channels);
     Buffer& forces = m.staging->zeroed("forces", 3*edges);
     args.edge_receivers = receivers.gpu_address();
     args.unit_xyz = unit.gpu_address();
-    args.harmonics = Y.gpu_address();
-    args.gradients = gradients.gpu_address();
+    args.harmonics_out = Y.gpu_address();
+    args.gradients_out = gradients.gpu_address();
     args.adjoint = adjoint.gpu_address();
     args.output = forces.gpu_address();
     for (const Buffer* buffer : std::initializer_list<const Buffer*>{
-            &receivers, &unit, &Y, &gradients, &adjoint})
+            &receivers, &unit, &adjoint})
         batch.use_buffer(*buffer, false);
-    batch.use_buffer(forces, true);
+    batch.use_buffer(Y, true).use_buffer(gradients, true).use_buffer(forces, true);
+    // The serial encoder orders the harmonic pass before the edge pass.
     batch.set_value(0, args)
-        .dispatch_threads(m.reverse, {edges*simd_width}, {threadgroup_size});
+        .dispatch_threads(m.harmonics[Impl::degree_of(harmonic_count)],
+            {edges}, {threadgroup_size});
+    if (profiling_enabled()) {
+        const double harmonics_seconds = batch.submit_and_wait().gpu_seconds;
+        m.statistics.gpu_seconds += harmonics_seconds;
+        m.statistics.reverse_seconds += harmonics_seconds;
+        m.statistics.harmonics_seconds += harmonics_seconds;
+        batch = m.device.begin();
+        m.stage_graph(graph, spline, batch, args);
+        for (const Buffer* buffer : std::initializer_list<const Buffer*>{
+                &receivers, &unit, &adjoint, &Y, &gradients})
+            batch.use_buffer(*buffer, false);
+        batch.use_buffer(forces, true).set_value(0, args);
+    }
+    batch.dispatch_threads(m.reverse, {edges*simd_width}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
-    m.statistics.gpu_seconds += batch.submit_and_wait().gpu_seconds;
+    const double gpu_seconds = batch.submit_and_wait().gpu_seconds;
+    m.statistics.gpu_seconds += gpu_seconds;
+    m.statistics.reverse_seconds += gpu_seconds;
     const auto readback = Clock::now();
     const float* values = forces.data<float>();
     for (std::size_t i = 0; i < 3*edges; ++i)
