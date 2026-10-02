@@ -30,6 +30,11 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_m0_module.hpp"
+#include "metal_r1_module.hpp"
+#include "metal_view_registry.hpp"
+#endif
 #include "cblas.hpp"
 #include "device_backend.hpp"
 #include "kernel_launch_profile.hpp"
@@ -204,6 +209,16 @@ void MACEKokkos<Precision>::compute_H1(
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     if (H1.extent(0) < M0.extent(0))
         Kokkos::realloc(H1, M0.extent(0), M0.extent(1), M0.extent(2));
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>) {
+        // The Metal M0 forward already wrote H1 in its submission.
+        if (metal_m0_module
+                && metal_m0_module->take_fused_linear(M0.data(), H1.data(), num_nodes)) {
+            complete_device_stage("MACEKokkos::compute_H1");
+            return;
+        }
+    }
+#endif
 
     auto L_max = this->L_max;
     const int channels = num_channels;
@@ -1529,6 +1544,37 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                     H1.data(),
                     Phi1.data(),
                     r_cut};
+#ifdef SYMMETRIX_ENABLE_METAL
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (metal_r1_module) {
+                        metal_views->map(Y);
+                        metal_views->map(H1);
+                        metal_views->map(Phi1);
+                        // Fuse the A1 GEMMs that compute_A1 would launch next.
+                        symmetrix::execution::metal::MetalA1Request a1_request;
+                        bool fuse_a1 = !use_receiver_local_phi1()
+                            && !use_channel_tiled_phi1()
+                            && metal_a1_layout(&a1_request.layout)
+                            && Phi1.span_is_contiguous();
+                        if (fuse_a1) {
+                            ensure_mh0_a1_forward_capacity(num_nodes);
+                            fuse_a1 = A1.span_is_contiguous()
+                                && A1.extent(0) >= static_cast<std::size_t>(num_nodes);
+                        }
+                        if (fuse_a1) {
+                            metal_views->map(A1);
+                            a1_request.a1 = A1.data();
+                        }
+                        metal_r1_module->forward(args, {
+                            node_types.extent(0),
+                            type_to_active.extent(0),
+                            H1.extent(0)}, fuse_a1 ? &a1_request : nullptr);
+                        factorized_jit_launch_count += 1;
+                        factorized_jit_forward_launch_count += 1;
+                        return;
+                    }
+                }
+#endif
                 const auto owner =
                     jit_host_plugin->descriptor_v2().r1_forward_owner;
                 constexpr int forward_channel_tile = 16;
