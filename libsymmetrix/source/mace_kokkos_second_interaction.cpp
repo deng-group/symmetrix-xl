@@ -571,6 +571,44 @@ void MACEKokkos<Precision>::compute_A1_scaled(
     const int active_type_count = num_active_types;
     const auto num_channels = this->num_channels;
     const auto num_lm = this->num_lm;
+    if constexpr (std::is_same_v<
+            typename Kokkos::DefaultExecutionSpace::memory_space,
+            Kokkos::HostSpace>) {
+        // One host worker per node streams its contiguous [lm, channel] row,
+        // which vectorizes where the team decomposition does not.
+        if (A1.extent_int(1) == num_lm && A1.extent_int(2) == num_channels) {
+            const std::size_t row_length =
+                static_cast<std::size_t>(num_lm)*static_cast<std::size_t>(num_channels);
+            Kokkos::parallel_for(
+                "MACEKokkos::compute_A1_scaled host",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                    Kokkos::IndexType<std::size_t>>(execution_space, 0, num_nodes),
+                [=] (const std::size_t node) {
+                    const int i0 = first_neigh(node);
+                    const int type_i = recompute_splines
+                        ? type_map(node_types(node)) : 0;
+                    double A1_scale_factor = 0.0;
+                    for (int j=0; j<num_neigh(node); ++j) {
+                        const int edge = i0+j;
+                        if (recompute_splines) {
+                            const int type_j = type_map(neigh_types(edge));
+                            const int edge_type = type_i <= type_j
+                                ? type_i*(2*active_type_count-type_i-1)/2+type_j
+                                : type_j*(2*active_type_count-type_j-1)/2+type_i;
+                            A1_scale_factor +=
+                                splines.evaluate_function(edge_type, r(edge), 0);
+                        } else
+                            A1_scale_factor += A1_spline_values(edge,0);
+                    }
+                    A1_scale_factor += 1.0;
+                    Precision* row = &A1(node,0,0);
+                    for (std::size_t lmk=0; lmk<row_length; ++lmk)
+                        row[lmk] /= A1_scale_factor;
+                });
+            complete_device_stage("MACEKokkos::compute_A1_scaled");
+            return;
+        }
+    }
     Kokkos::parallel_for(
         "MACEKokkos::compute_A1_scaled",
         Kokkos::TeamPolicy<>(
@@ -653,6 +691,78 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
     const bool compact_geometry = use_compact_edge_geometry();
     const auto unit_direction = execution_prepared_unit_direction;
     auto node_forces = this->node_forces;
+    if constexpr (std::is_same_v<
+            typename Kokkos::DefaultExecutionSpace::memory_space,
+            Kokkos::HostSpace>) {
+        // Host counterpart of the team kernel below; contiguous node rows let
+        // the dot product and scaling vectorize.
+        if (A1.extent_int(1) == num_lm && A1.extent_int(2) == num_channels
+                && A1_adj.extent_int(1) == num_lm
+                && A1_adj.extent_int(2) == num_channels) {
+            const std::size_t row_length =
+                static_cast<std::size_t>(num_lm)*static_cast<std::size_t>(num_channels);
+            Kokkos::parallel_for(
+                "MACEKokkos::reverse_A1_scaled host",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                    Kokkos::IndexType<std::size_t>>(execution_space, 0, num_nodes),
+                [=] (const std::size_t node) {
+                    const int i0 = first_neigh(node);
+                    const int type_i = recompute_splines
+                        ? type_map(node_types(node)) : 0;
+                    const auto edge_type_of = [&] (const int edge) {
+                        const int type_j = type_map(neigh_types(edge));
+                        return type_i <= type_j
+                            ? type_i*(2*active_type_count-type_i-1)/2+type_j
+                            : type_j*(2*active_type_count-type_j-1)/2+type_i;
+                    };
+                    double A1_scale_factor = 0.0;
+                    for (int j=0; j<num_neigh(node); ++j) {
+                        const int edge = i0+j;
+                        A1_scale_factor += recompute_splines
+                            ? splines.evaluate_function(edge_type_of(edge), r(edge), 0)
+                            : A1_spline_values(edge,0);
+                    }
+                    A1_scale_factor += 1.0;
+                    Precision* adjoint_row = &A1_adj(node,0,0);
+                    double dA1_dot_A1 = 0.0;
+                    if (reuse_adjoint)
+                        dA1_dot_A1 = scale_adjoint(node);
+                    else {
+                        // Four partial sums break the FP64 add dependency chain.
+                        const Precision* value_row = &A1(node,0,0);
+                        double partial[4] = {0.0, 0.0, 0.0, 0.0};
+                        std::size_t lmk = 0;
+                        for (; lmk+4<=row_length; lmk+=4)
+                            for (int lane=0; lane<4; ++lane)
+                                partial[lane] +=
+                                    adjoint_row[lmk+lane]*value_row[lmk+lane];
+                        for (; lmk<row_length; ++lmk)
+                            partial[0] += adjoint_row[lmk]*value_row[lmk];
+                        dA1_dot_A1 = (partial[0]+partial[1])+(partial[2]+partial[3]);
+                    }
+                    for (int j=0; j<num_neigh(node); ++j) {
+                        const int ij = i0+j;
+                        const std::size_t edge = static_cast<std::size_t>(ij);
+                        double f;
+                        double d;
+                        if (recompute_splines)
+                            splines.evaluate_function(edge_type_of(ij), r(ij), 0, f, d);
+                        else {
+                            f = A1_spline_values(ij,0);
+                            d = A1_spline_derivs(ij,0);
+                        }
+                        const double scale = dA1_dot_A1/A1_scale_factor*d;
+                        for (int k=0; k<3; ++k)
+                            node_forces(3*edge+k) += scale*(compact_geometry
+                                ? unit_direction(3*edge+k) : xyz(3*edge+k)/r(ij));
+                    }
+                    for (std::size_t lmk=0; lmk<row_length; ++lmk)
+                        adjoint_row[lmk] /= A1_scale_factor;
+                });
+            complete_device_stage("MACEKokkos::reverse_A1_scaled");
+            return;
+        }
+    }
     Kokkos::parallel_for(
         "MACEKokkos::reverse_A1_scaled",
         Kokkos::TeamPolicy<>(
