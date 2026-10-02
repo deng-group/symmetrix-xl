@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -278,7 +280,7 @@ int main()
             "kernel dereferences device pointers embedded in a packet");
     }
 
-    // Strided MPS GEMM followed by a compute dispatch in the same batch.
+    // Strided GEMM followed by a compute dispatch in the same batch.
     {
         const std::uint32_t rows = 37, inner = 70, columns = 50;
         const std::uint32_t left_stride = 96, result_stride = 64;
@@ -331,11 +333,48 @@ int main()
                     && transposed.data<float>()[k*rows+i]
                         == left.data<float>()[left_offset+i*left_stride+k];
         check(worst < 1e-5f,
-            "strided MPS GEMM matches FP64 reference, relative error "
+            "strided GEMM matches FP64 reference, relative error "
             +std::to_string(worst));
-        check(transposed_exact, "transposed MPS GEMM operand is exact");
+        check(transposed_exact, "transposed GEMM operand is exact");
         check(*probe_out.data<std::uint32_t>() == 32,
             "compute dispatch after GEMM reopens its encoder");
+    }
+
+    // Large strided GEMM at evaluator scale writes every output row; an
+    // earlier MPS-based implementation silently skipped 384-row blocks here.
+    {
+        const std::uint32_t rows = 78125, inner = 128, columns = 128;
+        const std::size_t left_pitch = 2048, result_pitch = 5120;
+        const mtl::Buffer left = device.allocate(rows*left_pitch*sizeof(float));
+        const mtl::Buffer right = device.allocate(inner*columns*sizeof(float));
+        const mtl::Buffer result = device.allocate(rows*result_pitch*sizeof(float));
+        std::mt19937 generator(1);
+        std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+        for (std::size_t i = 0; i < rows*left_pitch; ++i)
+            left.data<float>()[i] = uniform(generator);
+        for (std::size_t i = 0; i < inner*columns; ++i)
+            right.data<float>()[i] = uniform(generator);
+        std::fill(result.data<float>(), result.data<float>()+rows*result_pitch,
+            std::numeric_limits<float>::quiet_NaN());
+        auto batch = device.begin();
+        batch.gemm({&left, 0, rows, inner, left_pitch*sizeof(float)},
+            {&right, 0, inner, columns, columns*sizeof(float)},
+            {&result, 0, rows, columns, result_pitch*sizeof(float)});
+        batch.submit_and_wait();
+        std::size_t wrong_rows = 0;
+        for (std::size_t r = 0; r < rows; ++r)
+            for (std::uint32_t j = 0; j < columns; ++j) {
+                double expected = 0.0;
+                for (std::uint32_t k = 0; k < inner; ++k)
+                    expected += static_cast<double>(left.data<float>()[r*left_pitch+k])
+                        *right.data<float>()[k*columns+j];
+                if (!(std::fabs(result.data<float>()[r*result_pitch+j]-expected) < 1e-3)) {
+                    ++wrong_rows;
+                    break;
+                }
+            }
+        check(wrong_rows == 0, "large strided GEMM writes all "+std::to_string(rows)
+            +" rows ("+std::to_string(wrong_rows)+" wrong)");
     }
 
     // Error reporting.

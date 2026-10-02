@@ -2,10 +2,11 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <unistd.h>
 
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -107,7 +108,7 @@ struct CommandBatch::Impl {
     bool committed = false;
     bool waited = false;
     // Residency declared with use_buffer; replayed on encoders opened after
-    // an MPS GEMM so later dispatches still see indirectly used buffers.
+    // the encoder is closed so later dispatches still see indirectly used buffers.
     std::vector<std::pair<id<MTLBuffer>, MTLResourceUsage>> resident;
 
     // Opens a compute encoder on demand, e.g. after a GEMM closed one.
@@ -334,6 +335,170 @@ void validate_matrix(const MatrixView& view, const char* role)
 
 }  // namespace
 
+namespace {
+
+// Native FP32 GEMM. MPSMatrixMultiplication was found to skip whole output
+// tiles without reporting an error for large strided matrices, so the
+// runtime encodes its own kernel. A 128-thread threadgroup owns a 32 x 32
+// output tile and walks the interior in chunks of 32: the four SIMD groups
+// stage zero-padded A and B chunks in threadgroup memory, then each
+// accumulates a 16 x 16 quadrant with 8 x 8 simdgroup matrices. Padding lets
+// partial edge tiles take the same path; their stores are guarded.
+constexpr const char* gemm_source = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct GemmArgs {
+    device const float* left;
+    device const float* right;
+    device float* result;
+    uint rows;
+    uint columns;
+    uint interior;
+    uint left_pitch;
+    uint right_pitch;
+    uint result_pitch;
+    uint transpose_left;
+    uint transpose_right;
+    float alpha;
+    float beta;
+};
+
+constant constexpr uint tile = 32;
+
+kernel void symmetrix_gemm(
+    constant GemmArgs& a [[buffer(0)]],
+    uint2 position [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint group [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float left_tile[tile * tile];
+    threadgroup float right_tile[tile * tile];
+    threadgroup float out_tile[tile * tile];
+    const uint row0 = position.y * tile;
+    const uint column0 = position.x * tile;
+    const uint quadrant_row = (group / 2u) * 16u;
+    const uint quadrant_column = (group % 2u) * 16u;
+    simdgroup_float8x8 accumulator[2][2];
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 2; ++j)
+            accumulator[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const bool aligned = a.transpose_left == 0 && a.transpose_right == 0
+        && a.left_pitch % 4u == 0u && a.right_pitch % 4u == 0u
+        && ((ulong(a.left) | ulong(a.right)) & 15ul) == 0ul;
+    for (uint k0 = 0; k0 < a.interior; k0 += tile) {
+        const bool interior_chunk = aligned && row0 + tile <= a.rows
+            && column0 + tile <= a.columns && k0 + tile <= a.interior;
+        if (interior_chunk) {
+            // Two float4 of A and two of B per thread: row r, columns 4q..4q+3.
+            for (uint vector = thread_index; vector < tile * tile / 4u; vector += 128u) {
+                const uint r = vector / (tile / 4u);
+                const uint q = vector % (tile / 4u);
+                const float4 x = *reinterpret_cast<device const float4*>(
+                    a.left + ulong(row0 + r) * a.left_pitch + k0 + 4u * q);
+                const float4 y = *reinterpret_cast<device const float4*>(
+                    a.right + ulong(k0 + r) * a.right_pitch + column0 + 4u * q);
+                *reinterpret_cast<threadgroup float4*>(left_tile + r * tile + 4u * q) = x;
+                *reinterpret_cast<threadgroup float4*>(right_tile + r * tile + 4u * q) = y;
+            }
+        } else
+        // Guarded scalar staging with zero padding at the matrix edges.
+        for (uint element = thread_index; element < tile * tile; element += 128u) {
+            const uint r = element / tile;
+            const uint c = element % tile;
+            const uint i = row0 + r, k = k0 + c;
+            float value = 0.0f;
+            if (i < a.rows && k < a.interior)
+                value = a.transpose_left != 0 ? a.left[ulong(k) * a.left_pitch + i]
+                                              : a.left[ulong(i) * a.left_pitch + k];
+            left_tile[element] = value;
+            const uint kk = k0 + r, j = column0 + c;
+            float other = 0.0f;
+            if (kk < a.interior && j < a.columns)
+                other = a.transpose_right != 0 ? a.right[ulong(j) * a.right_pitch + kk]
+                                               : a.right[ulong(kk) * a.right_pitch + j];
+            right_tile[element] = other;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < tile; k += 8u) {
+            simdgroup_float8x8 left[2];
+            simdgroup_float8x8 right[2];
+            for (uint i = 0; i < 2; ++i)
+                simdgroup_load(left[i], left_tile, tile,
+                    ulong2(k, quadrant_row + 8u * i));
+            for (uint j = 0; j < 2; ++j)
+                simdgroup_load(right[j], right_tile, tile,
+                    ulong2(quadrant_column + 8u * j, k));
+            for (uint i = 0; i < 2; ++i)
+                for (uint j = 0; j < 2; ++j)
+                    simdgroup_multiply_accumulate(
+                        accumulator[i][j], left[i], right[j], accumulator[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 2; ++i)
+        for (uint j = 0; j < 2; ++j)
+            simdgroup_store(accumulator[i][j], out_tile, tile,
+                ulong2(quadrant_column + 8u * j, quadrant_row + 8u * i));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint element = thread_index; element < tile * tile; element += 128u) {
+        const uint i = row0 + element / tile;
+        const uint j = column0 + element % tile;
+        if (i >= a.rows || j >= a.columns)
+            continue;
+        device float* out = a.result + ulong(i) * a.result_pitch + j;
+        const float sum = out_tile[element];
+        *out = a.beta != 0.0f ? a.alpha * sum + a.beta * *out : a.alpha * sum;
+    }
+}
+)MSL";
+
+struct GemmArgs {
+    std::uint64_t left;
+    std::uint64_t right;
+    std::uint64_t result;
+    std::uint32_t rows;
+    std::uint32_t columns;
+    std::uint32_t interior;
+    std::uint32_t left_pitch;
+    std::uint32_t right_pitch;
+    std::uint32_t result_pitch;
+    std::uint32_t transpose_left;
+    std::uint32_t transpose_right;
+    float alpha;
+    float beta;
+};
+static_assert(sizeof(GemmArgs) == 64);
+
+// One compiled GEMM pipeline per device for the process lifetime.
+id<MTLComputePipelineState> gemm_pipeline(id<MTLDevice> device)
+{
+    static std::mutex mutex;
+    static std::map<void*, id<MTLComputePipelineState>> pipelines;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = pipelines.find((__bridge void*)device);
+    if (found != pipelines.end())
+        return found->second;
+    NSError* error = nil;
+    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+    options.languageVersion = MTLLanguageVersion3_0;
+    id<MTLLibrary> library = [device
+        newLibraryWithSource:[NSString stringWithUTF8String:gemm_source]
+                     options:options
+                       error:&error];
+    if (library == nil)
+        fail("could not compile the GEMM kernel: "+describe(error));
+    id<MTLFunction> function = [library newFunctionWithName:@"symmetrix_gemm"];
+    id<MTLComputePipelineState> state =
+        [device newComputePipelineStateWithFunction:function error:&error];
+    if (state == nil)
+        fail("could not create the GEMM pipeline: "+describe(error));
+    pipelines.emplace((__bridge void*)device, state);
+    return state;
+}
+
+}  // namespace
+
 CommandBatch& CommandBatch::gemm(
     const MatrixView& left, const MatrixView& right, const MatrixView& result,
     const bool transpose_left, const bool transpose_right,
@@ -350,32 +515,30 @@ CommandBatch& CommandBatch::gemm(
     const std::uint32_t columns = transpose_right ? right.rows : right.columns;
     if (interior != right_interior || result.rows != rows || result.columns != columns)
         fail("GEMM matrix shapes do not conform");
-    impl_->end_encoding();
+    for (const MatrixView* view : {&left, &right, &result})
+        if (view->row_bytes % sizeof(float) != 0 || view->offset_bytes % sizeof(float) != 0)
+            fail("GEMM rows and offsets must be whole FP32 elements");
+    impl_->require_encoding();
     @autoreleasepool {
         id<MTLDevice> device = impl_->command_buffer.device;
-        auto matrix = [](const MatrixView& view) {
-            MPSMatrixDescriptor* descriptor =
-                [MPSMatrixDescriptor matrixDescriptorWithRows:view.rows
-                                                      columns:view.columns
-                                                     rowBytes:view.row_bytes
-                                                     dataType:MPSDataTypeFloat32];
-            return [[MPSMatrix alloc] initWithBuffer:view.buffer->impl_->buffer
-                                              offset:view.offset_bytes
-                                          descriptor:descriptor];
-        };
-        MPSMatrixMultiplication* kernel = [[MPSMatrixMultiplication alloc]
-            initWithDevice:device
-             transposeLeft:transpose_left
-            transposeRight:transpose_right
-                resultRows:rows
-             resultColumns:columns
-           interiorColumns:interior
-                     alpha:alpha
-                      beta:beta];
-        [kernel encodeToCommandBuffer:impl_->command_buffer
-                           leftMatrix:matrix(left)
-                          rightMatrix:matrix(right)
-                         resultMatrix:matrix(result)];
+        const GemmArgs args{
+            left.buffer->impl_->buffer.gpuAddress+left.offset_bytes,
+            right.buffer->impl_->buffer.gpuAddress+right.offset_bytes,
+            result.buffer->impl_->buffer.gpuAddress+result.offset_bytes,
+            rows, columns, interior,
+            static_cast<std::uint32_t>(left.row_bytes/sizeof(float)),
+            static_cast<std::uint32_t>(right.row_bytes/sizeof(float)),
+            static_cast<std::uint32_t>(result.row_bytes/sizeof(float)),
+            transpose_left ? 1u : 0u, transpose_right ? 1u : 0u,
+            static_cast<float>(alpha), static_cast<float>(beta)};
+        [impl_->encoder useResource:left.buffer->impl_->buffer usage:MTLResourceUsageRead];
+        [impl_->encoder useResource:right.buffer->impl_->buffer usage:MTLResourceUsageRead];
+        [impl_->encoder useResource:result.buffer->impl_->buffer
+                              usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        [impl_->encoder setComputePipelineState:gemm_pipeline(device)];
+        [impl_->encoder setBytes:&args length:sizeof(args) atIndex:0];
+        [impl_->encoder dispatchThreadgroups:MTLSizeMake((columns+31)/32, (rows+31)/32, 1)
+                       threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
     ++impl_->dispatch_count;
     return *this;

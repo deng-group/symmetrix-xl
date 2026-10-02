@@ -167,9 +167,9 @@ public:
     // the dispatches that follow.
     CommandBatch& use_buffer(const Buffer& buffer, bool written);
 
-    // result = alpha*op(left)*op(right) + beta*result with Metal Performance
-    // Shaders. The GEMM runs between compute encoders, so argument bindings
-    // set before it do not carry over; buffer residency does.
+    // result = alpha*op(left)*op(right) + beta*result with the runtime's FP32
+    // GEMM kernel, encoded in the current compute encoder. It replaces the
+    // pipeline and buffer(0) bindings, so set arguments again afterwards.
     CommandBatch& gemm(
         const MatrixView& left, const MatrixView& right, const MatrixView& result,
         bool transpose_left = false, bool transpose_right = false,
