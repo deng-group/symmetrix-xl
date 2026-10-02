@@ -53,6 +53,11 @@ struct MetalA1Layout {
     const float* weights_trans[4] = {};
 };
 
+struct MetalA1Request {
+    MetalA1Layout layout;
+    float* a1 = nullptr;
+};
+
 struct MetalR1Statistics {
     std::uint64_t forward_launches = 0;
     std::uint64_t reverse_launches = 0;
@@ -65,6 +70,8 @@ struct MetalR1Statistics {
     double edge_seconds = 0.0;
     std::uint64_t a1_forward_launches = 0;
     std::uint64_t a1_reverse_launches = 0;
+    std::uint64_t row_scale_launches = 0;
+    std::uint64_t fused_a1_launches = 0;
     std::uint64_t resident_uploads_skipped = 0;
     double a1_seconds = 0.0;
     std::uint64_t blocked_edge_launches = 0;
@@ -84,9 +91,12 @@ public:
     // Host ranges in this map are read and written in place.
     void set_host_memory(std::shared_ptr<const HostMemoryMap> host_memory);
 
+    // With a1_request, the A1 GEMMs run in the same submission and the next
+    // a1_forward for this Phi1 and A1 returns without a launch.
     void forward(
         const SymmetrixJitHostR1ForwardArgsV2& args,
-        const MetalR1ForwardExtents& extents);
+        const MetalR1ForwardExtents& extents,
+        const MetalA1Request* a1_request = nullptr);
     void reverse(
         const SymmetrixJitHostR1SourceArgsV2& source,
         const SymmetrixJitHostR1EdgeArgsV2& edge,
@@ -106,6 +116,14 @@ public:
         std::size_t num_nodes, std::size_t capacity_nodes,
         const MetalA1Layout& layout,
         const float* a1_adjoint, float* phi1_adjoint);
+
+    // rows[node, :] *= factors[node] in place for host memory mapped for GPU
+    // access, as the A1 density scaling does. Returns false, without side
+    // effects, when rows are not mapped; a staged copy would cost more than
+    // the host pass it replaces.
+    bool scale_node_rows(
+        float* rows, std::size_t num_nodes, std::size_t row_length,
+        const float* factors);
 
 private:
     struct Impl;

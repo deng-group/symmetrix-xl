@@ -49,9 +49,39 @@ std::uint32_t checked_u32(const std::int64_t value, const char* field)
 
 }  // namespace
 
+constexpr const char* row_scale_source = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RowScaleArgs {
+    uint num_nodes;
+    uint row_length;
+    device float* rows;
+    device const float* factors;
+};
+
+kernel void symmetrix_scale_node_rows(
+    constant RowScaleArgs& a [[buffer(0)]],
+    uint flat [[thread_position_in_grid]])
+{
+    const uint node = flat / a.row_length;
+    if (node < a.num_nodes)
+        a.rows[flat] *= a.factors[node];
+}
+)MSL";
+
+struct RowScaleArgs {
+    std::uint32_t num_nodes;
+    std::uint32_t row_length;
+    std::uint64_t rows;
+    std::uint64_t factors;
+};
+static_assert(sizeof(RowScaleArgs) == 24);
+
 struct MetalR1Module::Impl {
     Device device;
     Pipeline forward;
+    Pipeline row_scale;
     Pipeline source;
     Pipeline edge;
     // Present when channels split into 32-wide blocks; one threadgroup per
@@ -75,6 +105,52 @@ struct MetalR1Module::Impl {
     };
     Resident phi1;
     Resident phi1_adjoint;
+    // A1 already computed by a forward that fused the A1 GEMMs.
+    struct FusedA1 {
+        const float* phi1 = nullptr;
+        const float* a1 = nullptr;
+        std::size_t nodes = 0;
+    } fused_a1;
+
+    // A1 = Phi1 W as 2l+1 strided GEMMs per degree over every node.
+    void encode_a1(CommandBatch& batch, const DeviceSpan& input,
+        const DeviceSpan& output, const std::size_t num_nodes,
+        const MetalA1Layout& layout)
+    {
+        const std::size_t channels = static_cast<std::size_t>(shape.channels);
+        const auto rows = static_cast<std::uint32_t>(num_nodes);
+        const auto c = static_cast<std::uint32_t>(channels);
+        const std::size_t input_row = layout.num_lme*channels*sizeof(float);
+        const std::size_t output_row = layout.num_lm*channels*sizeof(float);
+        for (int l = 0; l <= layout.l_max; ++l) {
+            const auto inputs = static_cast<std::uint32_t>(layout.eta[l]*channels);
+            if (inputs == 0)
+                continue;
+            const Buffer& weights = staging->persistent(layout.weights[l],
+                static_cast<std::size_t>(inputs)*channels*sizeof(float));
+            for (int row = 0; row < 2*l+1; ++row)
+                batch.gemm(
+                    {input.buffer, input.offset
+                        +(layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
+                        *sizeof(float), rows, inputs, input_row},
+                    {&weights, 0, inputs, c, channels*sizeof(float)},
+                    {output.buffer, output.offset
+                        +(static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
+                        rows, c, output_row});
+        }
+    }
+
+    // Degrees without paths contribute zero rows, as the zero-depth host GEMM.
+    void zero_empty_a1_degrees(float* a1, const std::size_t num_nodes,
+        const MetalA1Layout& layout) const
+    {
+        const std::size_t channels = static_cast<std::size_t>(shape.channels);
+        for (int l = 0; l <= layout.l_max; ++l)
+            if (layout.eta[l] == 0)
+                for (std::size_t node = 0; node < num_nodes; ++node)
+                    std::memset(a1+(node*layout.num_lm+l*l)*channels, 0,
+                        (2*l+1)*channels*sizeof(float));
+    }
 
     static void validate(const MetalA1Layout& layout, MetalStaging& staging)
     {
@@ -153,6 +229,9 @@ MetalR1Module::MetalR1Module(
     }
     if (impl_->edge.thread_execution_width() != simd_width)
         fail("the edge kernel requires 32-wide SIMD groups");
+    impl_->row_scale = impl_->device.pipeline(
+        impl_->device.compile(row_scale_source, module_compile_options()),
+        "symmetrix_scale_node_rows");
 }
 
 MetalR1Module::~MetalR1Module() = default;
@@ -176,13 +255,15 @@ const MetalR1Statistics& MetalR1Module::statistics() const
 
 void MetalR1Module::forward(
     const SymmetrixJitHostR1ForwardArgsV2& args,
-    const MetalR1ForwardExtents& extents)
+    const MetalR1ForwardExtents& extents,
+    const MetalA1Request* a1_request)
 {
     if (args.struct_size != sizeof(SymmetrixJitHostR1ForwardArgsV2))
         fail("forward packet size does not match");
     auto& m = *impl_;
     const MetalR1Shape& s = m.shape;
     m.phi1 = {};
+    m.fused_a1 = {};
     const std::size_t nodes = checked_u32(args.num_nodes, "num_nodes");
     const std::size_t edges = checked_u32(args.num_edges, "num_edges");
     if (nodes == 0)
@@ -235,6 +316,14 @@ void MetalR1Module::forward(
     batch.use_buffer(*output.buffer, true);
     batch.set_value(0, packet)
         .dispatch_threads(m.forward, {nodes*channels}, {threadgroup_size});
+    // The A1 GEMMs read Phi1 in the same submission, so compute_A1 needs no
+    // further launch; the serial command order makes Phi1 complete first.
+    if (a1_request != nullptr) {
+        Impl::validate(a1_request->layout, *m.staging);
+        const DeviceSpan a1 = m.staging->output("a1_output", a1_request->a1,
+            nodes*a1_request->layout.num_lm*channels);
+        m.encode_a1(batch, output, a1, nodes, a1_request->layout);
+    }
     m.statistics.staging_seconds += seconds_since(staging);
 
     const double forward_seconds = batch.submit_and_wait().gpu_seconds;
@@ -242,6 +331,12 @@ void MetalR1Module::forward(
     m.statistics.forward_seconds += forward_seconds;
     const auto readback = Clock::now();
     m.staging->complete();
+    if (a1_request != nullptr) {
+        m.zero_empty_a1_degrees(a1_request->a1, nodes, a1_request->layout);
+        m.fused_a1 = {phi1, a1_request->a1, nodes};
+        ++m.statistics.a1_forward_launches;
+        ++m.statistics.fused_a1_launches;
+    }
     if (phi1_staged)
         m.phi1 = {args.output, output_count};
     m.statistics.staging_seconds += seconds_since(readback);
@@ -445,6 +540,12 @@ bool MetalR1Module::a1_forward(
     auto& m = *impl_;
     Impl::validate(layout, *m.staging);
     const std::size_t channels = static_cast<std::size_t>(m.shape.channels);
+    if (num_nodes != 0 && m.fused_a1.phi1 == phi1 && m.fused_a1.a1 == a1
+            && m.fused_a1.nodes == num_nodes) {
+        m.fused_a1 = {};
+        return true;
+    }
+    m.fused_a1 = {};
     const std::size_t phi1_count = num_nodes*layout.num_lme*channels;
     const bool phi1_resident = m.phi1.matches(phi1, phi1_count);
     if (num_nodes == 0
@@ -452,44 +553,20 @@ bool MetalR1Module::a1_forward(
                 || m.staging->is_mapped(phi1, phi1_count*sizeof(float))))
         return false;
     checked_u32(static_cast<std::int64_t>(num_nodes), "A1 node count");
-    const auto rows = static_cast<std::uint32_t>(num_nodes);
-    const auto c = static_cast<std::uint32_t>(channels);
     auto batch = m.device.begin();
     m.staging->begin();
     const DeviceSpan input = phi1_resident
         ? DeviceSpan{&m.slot("forward_output", phi1_count*sizeof(float)), 0}
         : m.staging->input("phi1", phi1, phi1_count);
-    const std::size_t output_count = num_nodes*layout.num_lm*channels;
-    const DeviceSpan output = m.staging->output("a1_output", a1, output_count);
-    const std::size_t input_row = layout.num_lme*channels*sizeof(float);
-    const std::size_t output_row = layout.num_lm*channels*sizeof(float);
-    for (int l = 0; l <= layout.l_max; ++l) {
-        const auto inputs = static_cast<std::uint32_t>(layout.eta[l]*channels);
-        if (inputs == 0)
-            continue;
-        const Buffer& weights = m.staging->persistent(
-            layout.weights[l], static_cast<std::size_t>(inputs)*channels*sizeof(float));
-        for (int row = 0; row < 2*l+1; ++row)
-            batch.gemm(
-                {input.buffer, input.offset
-                    +(layout.lme[l]*channels+static_cast<std::size_t>(row)*inputs)
-                    *sizeof(float), rows, inputs, input_row},
-                {&weights, 0, inputs, c, channels*sizeof(float)},
-                {output.buffer, output.offset
-                    +(static_cast<std::size_t>(l*l+row)*channels)*sizeof(float),
-                    rows, c, output_row});
-    }
+    const DeviceSpan output = m.staging->output(
+        "a1_output", a1, num_nodes*layout.num_lm*channels);
+    m.encode_a1(batch, input, output, num_nodes, layout);
     const double a1_seconds = batch.submit_and_wait().gpu_seconds;
     m.statistics.gpu_seconds += a1_seconds;
     m.statistics.a1_seconds += a1_seconds;
     const auto readback = Clock::now();
     m.staging->complete();
-    // Degrees without paths contribute zero rows, as the zero-depth host GEMM.
-    for (int l = 0; l <= layout.l_max; ++l)
-        if (layout.eta[l] == 0)
-            for (std::size_t node = 0; node < num_nodes; ++node)
-                std::memset(a1+(node*layout.num_lm+l*l)*channels, 0,
-                    (2*l+1)*channels*sizeof(float));
+    m.zero_empty_a1_degrees(a1, num_nodes, layout);
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.a1_forward_launches;
     return true;
@@ -558,6 +635,34 @@ void MetalR1Module::a1_reverse(
     }
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.a1_reverse_launches;
+}
+
+bool MetalR1Module::scale_node_rows(
+    float* rows, const std::size_t num_nodes, const std::size_t row_length,
+    const float* factors)
+{
+    auto& m = *impl_;
+    const std::size_t count = num_nodes*row_length;
+    if (count == 0 || !m.staging->is_mapped(rows, count*sizeof(float)))
+        return false;
+    checked_u32(static_cast<std::int64_t>(count), "row scale grid");
+    const auto staging = Clock::now();
+    auto batch = m.device.begin();
+    m.staging->begin();
+    const DeviceSpan values = m.staging->output("scaled_rows", rows, count, true);
+    Buffer& scale = m.staging->upload("row_factors", factors, num_nodes);
+    const RowScaleArgs args{static_cast<std::uint32_t>(num_nodes),
+        static_cast<std::uint32_t>(row_length), values.address(), scale.gpu_address()};
+    batch.use_buffer(*values.buffer, true).use_buffer(scale, false)
+        .set_value(0, args)
+        .dispatch_threads(m.row_scale, {count}, {threadgroup_size});
+    m.statistics.staging_seconds += seconds_since(staging);
+    const double seconds = batch.submit_and_wait().gpu_seconds;
+    m.statistics.gpu_seconds += seconds;
+    m.statistics.a1_seconds += seconds;
+    m.staging->complete();
+    ++m.statistics.row_scale_launches;
+    return true;
 }
 
 }  // namespace symmetrix::execution::metal

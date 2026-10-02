@@ -1539,10 +1539,25 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                         metal_views->map(Y);
                         metal_views->map(H1);
                         metal_views->map(Phi1);
+                        // Fuse the A1 GEMMs that compute_A1 would launch next.
+                        symmetrix::execution::metal::MetalA1Request a1_request;
+                        bool fuse_a1 = !use_receiver_local_phi1()
+                            && !use_channel_tiled_phi1()
+                            && metal_a1_layout(&a1_request.layout)
+                            && Phi1.span_is_contiguous();
+                        if (fuse_a1) {
+                            ensure_mh0_a1_forward_capacity(num_nodes);
+                            fuse_a1 = A1.span_is_contiguous()
+                                && A1.extent(0) >= static_cast<std::size_t>(num_nodes);
+                        }
+                        if (fuse_a1) {
+                            metal_views->map(A1);
+                            a1_request.a1 = A1.data();
+                        }
                         metal_r1_module->forward(args, {
                             node_types.extent(0),
                             type_to_active.extent(0),
-                            H1.extent(0)});
+                            H1.extent(0)}, fuse_a1 ? &a1_request : nullptr);
                         factorized_jit_launch_count += 1;
                         factorized_jit_forward_launch_count += 1;
                         return;

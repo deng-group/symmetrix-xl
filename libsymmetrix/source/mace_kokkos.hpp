@@ -1620,6 +1620,10 @@ bool A1_scaled;
 RadialFunctionSetKokkos<double> A1_splines;
 Kokkos::View<double**,Kokkos::LayoutRight> A1_spline_values;
 Kokkos::View<double**,Kokkos::LayoutRight> A1_spline_derivs;
+// rows[node, :] /= scales[node], on the GPU when Metal maps the rows.
+void scale_A1_rows_by_inverse(
+    Precision* rows, int num_nodes, std::size_t row_length,
+    const std::vector<double>& scales);
 void compute_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,

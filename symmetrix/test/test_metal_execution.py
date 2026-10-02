@@ -176,6 +176,10 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     # The evaluator's edge list is receiver-ordered, so the channel-blocked
     # edge kernel runs.
     assert statistics["blocked_edge_launches"] >= 1
+    # The A1 GEMMs share the R1 forward submission, and the A1 density
+    # scaling runs on the GPU over the shared A1 rows.
+    assert statistics["fused_a1_launches"] >= 1
+    assert statistics["row_scale_launches"] >= 1
     assert host.metal_status == "disabled"
     # FP32 summation order differs between the host owners and the GPU.
     assert abs(e_metal - e_host) / len(atoms) < 1e-5

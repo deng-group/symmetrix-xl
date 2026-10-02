@@ -13,6 +13,7 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 // TODO: remove some of these headers?
 #include "KokkosBatched_Util.hpp"
@@ -505,6 +506,31 @@ void MACEKokkos<Precision>::reverse_A1_from(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::scale_A1_rows_by_inverse(
+    Precision* rows,
+    const int num_nodes,
+    const std::size_t row_length,
+    const std::vector<double>& scales)
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>) {
+        std::vector<float> factors(scales.size());
+        for (std::size_t node = 0; node < scales.size(); ++node)
+            factors[node] = static_cast<float>(1.0/scales[node]);
+        if (metal_r1_module && metal_r1_module->scale_node_rows(
+                rows, static_cast<std::size_t>(num_nodes), row_length,
+                factors.data()))
+            return;
+    }
+#endif
+    for (std::size_t node = 0; node < static_cast<std::size_t>(num_nodes); ++node) {
+        Precision* row = rows+node*row_length;
+        for (std::size_t lmk = 0; lmk < row_length; ++lmk)
+            row[lmk] /= scales[node];
+    }
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -585,6 +611,17 @@ void MACEKokkos<Precision>::compute_A1_scaled(
         if (A1.extent_int(1) == num_lm && A1.extent_int(2) == num_channels) {
             const std::size_t row_length =
                 static_cast<std::size_t>(num_lm)*static_cast<std::size_t>(num_channels);
+            // With Metal, the host computes the per-node factors and the GPU
+            // scales the shared A1 rows in place.
+            std::vector<double> gpu_scales;
+#ifdef SYMMETRIX_ENABLE_METAL
+            if constexpr (std::is_same_v<Precision, float>)
+                if (metal_r1_module && metal_views) {
+                    metal_views->map(A1);
+                    gpu_scales.resize(static_cast<std::size_t>(num_nodes));
+                }
+#endif
+            double* const scale_out = gpu_scales.empty() ? nullptr : gpu_scales.data();
             Kokkos::parallel_for(
                 "MACEKokkos::compute_A1_scaled host",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
@@ -607,10 +644,16 @@ void MACEKokkos<Precision>::compute_A1_scaled(
                             A1_scale_factor += A1_spline_values(edge,0);
                     }
                     A1_scale_factor += 1.0;
+                    if (scale_out != nullptr) {
+                        scale_out[node] = A1_scale_factor;
+                        return;
+                    }
                     Precision* row = &A1(node,0,0);
                     for (std::size_t lmk=0; lmk<row_length; ++lmk)
                         row[lmk] /= A1_scale_factor;
                 });
+            if (scale_out != nullptr)
+                scale_A1_rows_by_inverse(A1.data(), num_nodes, row_length, gpu_scales);
             complete_device_stage("MACEKokkos::compute_A1_scaled");
             return;
         }
@@ -707,6 +750,15 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
                 && A1_adj.extent_int(2) == num_channels) {
             const std::size_t row_length =
                 static_cast<std::size_t>(num_lm)*static_cast<std::size_t>(num_channels);
+            std::vector<double> gpu_scales;
+#ifdef SYMMETRIX_ENABLE_METAL
+            if constexpr (std::is_same_v<Precision, float>)
+                if (metal_r1_module && metal_views) {
+                    metal_views->map(A1_adj);
+                    gpu_scales.resize(static_cast<std::size_t>(num_nodes));
+                }
+#endif
+            double* const scale_out = gpu_scales.empty() ? nullptr : gpu_scales.data();
             Kokkos::parallel_for(
                 "MACEKokkos::reverse_A1_scaled host",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
@@ -762,9 +814,15 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
                             node_forces(3*edge+k) += scale*(compact_geometry
                                 ? unit_direction(3*edge+k) : xyz(3*edge+k)/r(ij));
                     }
+                    if (scale_out != nullptr) {
+                        scale_out[node] = A1_scale_factor;
+                        return;
+                    }
                     for (std::size_t lmk=0; lmk<row_length; ++lmk)
                         adjoint_row[lmk] /= A1_scale_factor;
                 });
+            if (scale_out != nullptr)
+                scale_A1_rows_by_inverse(A1_adj.data(), num_nodes, row_length, gpu_scales);
             complete_device_stage("MACEKokkos::reverse_A1_scaled");
             return;
         }

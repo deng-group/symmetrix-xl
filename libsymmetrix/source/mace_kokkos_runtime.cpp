@@ -1585,6 +1585,10 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["a1_seconds"] = statistics.a1_seconds;
         values["blocked_edge_launches"] =
             static_cast<double>(statistics.blocked_edge_launches);
+        values["fused_a1_launches"] =
+            static_cast<double>(statistics.fused_a1_launches);
+        values["row_scale_launches"] =
+            static_cast<double>(statistics.row_scale_launches);
     }
     if (metal_views)
         values["mapped_views"] = static_cast<double>(metal_views->size());
