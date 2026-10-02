@@ -588,6 +588,11 @@ void MetalR0Module::coordinate_reverse(
     }
     Buffer& unit = m.staging->slot("unit_xyz", 3*edges*sizeof(float));
     float* unit_xyz = unit.data<float>();
+    if (coordinate_scalar_size != sizeof(float)
+            && coordinate_scalar_size != sizeof(double))
+        m.fail("coordinates must be FP32 or FP64");
+    if (coordinate_scalar_size == sizeof(float) && !coordinates_are_unit)
+        m.fail("FP32 coordinates must be unit directions");
     if (coordinates_are_unit && coordinate_scalar_size == sizeof(float)) {
         std::memcpy(unit_xyz, coordinates, 3*edges*sizeof(float));
     } else {

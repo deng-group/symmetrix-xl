@@ -413,6 +413,11 @@ void MetalR1Module::reverse(
 
     Buffer& unit_xyz = m.slot("unit_xyz", 3*edges*sizeof(float));
     float* unit = unit_xyz.data<float>();
+    if (edge.coordinate_scalar_size != sizeof(float)
+            && edge.coordinate_scalar_size != sizeof(double))
+        fail("coordinates must be FP32 or FP64");
+    if (edge.coordinate_scalar_size == sizeof(float) && edge.coordinates_are_unit == 0)
+        fail("FP32 coordinates must be unit directions");
     if (edge.coordinates_are_unit != 0 && edge.coordinate_scalar_size == sizeof(float)) {
         std::memcpy(unit, edge.xyz, 3*edges*sizeof(float));
     } else if (edge.coordinates_are_unit != 0) {

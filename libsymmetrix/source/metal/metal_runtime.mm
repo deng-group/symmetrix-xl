@@ -240,19 +240,37 @@ std::uint32_t Pipeline::static_threadgroup_memory_bytes() const
 // ----- CommandBatch -----
 
 CommandBatch::CommandBatch(CommandBatch&&) noexcept = default;
-CommandBatch& CommandBatch::operator=(CommandBatch&&) noexcept = default;
+
+namespace {
+
+// Wrapped host memory may be released by the caller right after a batch goes
+// out of scope or is replaced, so an in-flight batch is drained first.
+template <class Impl>
+void drain(Impl& impl)
+{
+    if (!impl)
+        return;
+    @autoreleasepool {
+        impl->end_encoding();
+        if (impl->committed && !impl->waited)
+            [impl->command_buffer waitUntilCompleted];
+    }
+}
+
+}  // namespace
+
+CommandBatch& CommandBatch::operator=(CommandBatch&& other) noexcept
+{
+    if (this != &other) {
+        drain(impl_);
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
 
 CommandBatch::~CommandBatch()
 {
-    if (!impl_)
-        return;
-    @autoreleasepool {
-        // Wrapped host memory may be released by the caller right after the
-        // batch goes out of scope, so an in-flight batch is drained here.
-        impl_->end_encoding();
-        if (impl_->committed && !impl_->waited)
-            [impl_->command_buffer waitUntilCompleted];
-    }
+    drain(impl_);
 }
 
 CommandBatch& CommandBatch::set_buffer(
