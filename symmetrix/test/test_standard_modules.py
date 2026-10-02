@@ -478,12 +478,37 @@ from compact_r1_model import foundation_r1_test_model
 from symmetrix import Symmetrix
 
 contract = json.loads(open(sys.argv[1]).read())
-model_path = sys.argv[2]
+model_path, dtype = sys.argv[2], sys.argv[3]
+model = foundation_r1_test_model(contract, atomic_numbers=(1, 8))
+# The helper's weights are diagonal or zero; random dense, per-type distinct
+# weights make transposes, pitches, and type indexing observable.
+rng = np.random.default_rng(11)
+channels = model["num_channels"]
+def randomize(values, scale):
+    if isinstance(values, dict):
+        return {name: randomize(value, scale) for name, value in values.items()}
+    values = np.asarray(values, dtype=float)
+    return (scale * rng.standard_normal(values.shape)).tolist()
+for key in ("H0_weights", "A0_weights", "H1_weights", "A1_weights",
+            "H2_weights_for_H1", "H2_weights_for_M1", "readout_1_weights"):
+    model[key] = randomize(model[key], 1.0 / np.sqrt(channels))
+for key in ("M0_weights", "M1_weights"):
+    model[key] = randomize(model[key], 0.5)
+# Density-scaled A0 and A1 select the scaled host paths.
+embedding = model["compact_radial"]["networks"]["R0"]["shape"][0]
+for name in ("A0", "A1"):
+    model["compact_radial"]["networks"][name] = {
+        "shape": [embedding, 1],
+        "weights": [randomize(np.zeros(embedding), 0.5)],
+        "activation": "silu",
+        "activation_scale": 1.0,
+        "postprocess": "tanh-square",
+    }
+    model[name + "_scaled"] = True
 with open(model_path, "w") as output:
-    json.dump(foundation_r1_test_model(contract, atomic_numbers=(1, 8)), output)
-rng = np.random.default_rng(7)
+    json.dump(model, output)
 atoms = Atoms(
-    ["H", "O"] * 6,
+    ["H", "O", "O"] * 4,
     positions=rng.uniform(0.0, 6.0, size=(12, 3)),
     cell=[6.0, 6.0, 6.0],
     pbc=True,
@@ -491,7 +516,7 @@ atoms = Atoms(
 results = {}
 for use_kokkos in (True, False):
     kwargs = {"streamed_edges": "generic"} if use_kokkos else {}
-    atoms.calc = Symmetrix(model_path, use_kokkos=use_kokkos, dtype="float64", **kwargs)
+    atoms.calc = Symmetrix(model_path, use_kokkos=use_kokkos, dtype=dtype, **kwargs)
     results[str(use_kokkos)] = {
         "energy": float(atoms.get_potential_energy()),
         "forces": atoms.get_forces().tolist(),
@@ -501,9 +526,19 @@ print("PARITY=" + json.dumps(results))
 """
 
 
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
 @pytest.mark.parametrize("threads", [1, 2])
-def test_kokkos_host_workers_match_generic_evaluator(tmp_path, threads):
-    pytest.importorskip("symmetrix.symmetrix")
+def test_kokkos_host_workers_match_generic_evaluator(tmp_path, threads, dtype):
+    try:
+        from symmetrix import symmetrix as native
+
+        space = native._kokkos_default_execution_space()
+    except (ImportError, AttributeError, RuntimeError) as error:
+        pytest.skip(f"native Kokkos extension unavailable: {error}")
+    if space not in ("Serial", "OpenMP"):
+        pytest.skip(f"host worker paths do not run on the {space} backend")
+    if threads > 1 and space == "Serial":
+        pytest.skip("a Serial build always runs one host worker")
     # One worker takes the batched whole-system host paths; compare it and a
     # multi-worker run against the independent generic evaluator.
     script = tmp_path / "parity.py"
@@ -524,7 +559,13 @@ def test_kokkos_host_workers_match_generic_evaluator(tmp_path, threads):
         ),
     )
     completed = subprocess.run(
-        [sys.executable, str(script), str(contract), str(tmp_path / "model.json")],
+        [
+            sys.executable,
+            str(script),
+            str(contract),
+            str(tmp_path / "model.json"),
+            dtype,
+        ],
         capture_output=True,
         text=True,
         env=environment,
@@ -536,6 +577,12 @@ def test_kokkos_host_workers_match_generic_evaluator(tmp_path, threads):
     )
     results = json.loads(line.partition("=")[2])
     kokkos, generic = results["True"], results["False"]
-    assert kokkos["energy"] == pytest.approx(generic["energy"], rel=1e-10, abs=1e-10)
-    np.testing.assert_allclose(kokkos["forces"], generic["forces"], atol=1e-9)
-    np.testing.assert_allclose(kokkos["stress"], generic["stress"], atol=1e-9)
+    forces = np.asarray(generic["forces"])
+    assert np.abs(forces).max() > 1e-3, "the parity model produced no forces"
+    tolerance = 1e-9 if dtype == "float64" else 2e-4
+    scale = max(1.0, abs(generic["energy"]))
+    assert abs(kokkos["energy"] - generic["energy"]) <= tolerance * scale
+    np.testing.assert_allclose(
+        kokkos["forces"], forces, atol=tolerance * max(1.0, np.abs(forces).max())
+    )
+    np.testing.assert_allclose(kokkos["stress"], generic["stress"], atol=tolerance)

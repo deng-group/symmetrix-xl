@@ -225,11 +225,18 @@ def test_metal_is_opt_in_and_rejected_off_macos(monkeypatch):
 
 
 @pytest.mark.parametrize("model_type", ["MACEField", "MACE_Nonlinear"])
-def test_metal_rejects_unqualified_model_families(model_type, tmp_path):
-    available, reason = _metal_extension_available()
-    if not available:
-        pytest.skip(reason)
+def test_metal_rejects_unqualified_model_families(model_type, tmp_path, monkeypatch):
+    if sys.platform != "darwin":
+        pytest.skip("Metal requires macOS")
+    import symmetrix.calculator as calculator
     from symmetrix import Symmetrix
+
+    if not getattr(calculator.symmetrix, "_metal_supported", lambda: False)():
+        pytest.skip("the native extension was built without SYMMETRIX_METAL")
+    # The family check needs no GPU, so it also runs on virtual runners.
+    monkeypatch.setattr(
+        calculator.symmetrix, "_metal_device_ready", lambda: (True, ""), raising=False
+    )
 
     # The family is read from the JSON header before any weights are loaded.
     model = tmp_path / "header-only.json"
@@ -258,8 +265,14 @@ def test_metal_follows_changes_of_the_element_set(omat_small_model):
     host = Symmetrix(omat_small_model, species=species, dtype="float32")
     metal = Symmetrix(omat_small_model, species=species, dtype="float32", metal=True)
     for a_site, b_site in [
-        ("Sr", "Ti"), ("Ba", "Ti"), ("Ca", "Ti"), ("Sr", "Zr"),
-        ("Ba", "Zr"), ("Ca", "Zr"), ("Ba", "Ti"), ("Sr", "Zr"),
+        ("Sr", "Ti"),
+        ("Ba", "Ti"),
+        ("Ca", "Ti"),
+        ("Sr", "Zr"),
+        ("Ba", "Zr"),
+        ("Ca", "Zr"),
+        ("Ba", "Ti"),
+        ("Sr", "Zr"),
     ]:
         results = {}
         for name, calculator in (("host", host), ("metal", metal)):

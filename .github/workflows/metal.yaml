@@ -8,18 +8,9 @@ name: Metal
 on:
   pull_request:
     paths:
-    - 'libsymmetrix/source/metal/**'
-    - 'libsymmetrix/source/metal_view_registry.hpp'
-    - 'libsymmetrix/source/mace_kokkos*'
-    - 'libsymmetrix/source/standard_r0.hpp'
-    - 'libsymmetrix/source/multilayer_perceptron_kokkos.cpp'
-    - 'libsymmetrix/source/host_batched_readout.hpp'
-    - 'libsymmetrix/CMakeLists.txt'
-    - 'symmetrix/source/symmetrix/calculator.py'
-    - 'symmetrix/source/symmetrix/jit_codegen.py'
-    - 'symmetrix/source/symmetrix/metal_codegen.py'
-    - 'symmetrix/source/cpp/mace_kokkos.cpp'
-    - 'symmetrix/test/test_metal_execution.py'
+    - 'libsymmetrix/**'
+    - 'symmetrix/**'
+    - 'tools/**'
     - '.github/workflows/metal.yaml'
   push:
     branches:
@@ -79,4 +70,4 @@ jobs:
         source .venv/bin/activate
         python -c "import symmetrix.symmetrix as n; print('metal supported:', n._metal_supported(), 'device:', n._metal_device_ready())"
         cd symmetrix/test
-        pytest -v -rs test_metal_execution.py
+        pytest -v -rs test_metal_execution.py test_standard_modules.py test_jit.py test_build_tool.py
