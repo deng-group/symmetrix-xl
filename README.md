@@ -152,6 +152,9 @@ Detection requires exactly one visible CUDA architecture. If no GPU is visible
 on the build host, or visible GPUs have different architectures, specify the
 deployment target explicitly, for example `--arch sm120`.
 
+On Apple silicon Macs, an FP32 Apple GPU backend can be built from source with
+`SYMMETRIX_METAL=ON`; see [Apple Metal](docs/user/metal.md).
+
 Inspect the installed backends and test the one selected for the current
 machine:
 
