@@ -8,6 +8,7 @@ work for the U. S. Government, and is not subject to copyright.
 import json
 import logging
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -748,8 +749,33 @@ class Symmetrix(Calculator):
         dispersion_xc="pbe",
         dispersion_cutoff=None,
         dispersion_device=None,
+        metal=False,
         **kwargs,
     ):
+        self.metal_request = bool(metal)
+        self.metal_status = "disabled"
+        self.metal_device = None
+        if self.metal_request:
+            # Fail before any model or kernel setup: Metal is an opt-in Apple
+            # GPU backend, and CPU and CUDA selection does not involve it.
+            if sys.platform != "darwin":
+                raise ValueError(
+                    "metal=True is only available on macOS with an Apple GPU; "
+                    "on Linux use the CPU or CUDA backend (selected with "
+                    "SYMMETRIX_BACKEND) and leave metal unset"
+                )
+            if not getattr(symmetrix, "_metal_supported", lambda: False)():
+                raise RuntimeError(
+                    "metal=True requires a build with the Metal layer "
+                    "(SYMMETRIX_METAL=ON); see docs/user/metal.md"
+                )
+            ready, reason = getattr(
+                symmetrix, "_metal_device_ready", lambda: (True, "")
+            )()
+            if not ready:
+                raise RuntimeError(f"metal=True has no usable Metal GPU: {reason}")
+        if self.metal_request and dtype != "float32":
+            raise ValueError("metal=True requires dtype='float32'; Metal has no FP64")
         self.dispersion = bool(dispersion)
         self._dispersion_calculator = None
         self._dispersion_properties = ()
@@ -1159,6 +1185,11 @@ class Symmetrix(Calculator):
             use_kokkos=use_kokkos,
             streamed_edges=self.streamed_edges,
         )
+        if self.metal_request and self.metal_status != "ready":
+            raise RuntimeError(
+                "metal=True requires generated direct R1 execution on a host "
+                f"backend; JIT status is {self.jit_status!r}"
+            )
         if (
             self._native_execution_plan_available
             and self.execution_profile in _EXECUTION_PROFILES
@@ -1808,6 +1839,64 @@ class Symmetrix(Calculator):
         self.jit_operator_modules.update(modules)
         self.jit_diagnostics = (*self.jit_diagnostics, *diagnostics)
 
+    def _configure_metal_r1(self, model_data):
+        """Move R1, the standard R0 first interaction, and M0 onto the Metal GPU."""
+
+        from .metal_codegen import metal_r1_metadata, render_jit_r1_metal_source
+
+        loader = getattr(self.evaluator, "_load_metal_r1_module", None)
+        if loader is None:
+            raise RuntimeError("the native evaluator does not provide Metal R1 support")
+        contract = model_data.get("execution_contracts", {}).get("R1")
+        if not contract:
+            raise RuntimeError("Metal R1 execution requires an Execution R1 contract")
+        metadata = metal_r1_metadata(contract)
+        loader(
+            render_jit_r1_metal_source(contract),
+            metadata["channels"],
+            metadata["edge_harmonics"],
+            metadata["source_harmonics"],
+            metadata["output_components"],
+        )
+        if not self.evaluator._metal_r1_module_ready():
+            raise RuntimeError("the evaluator did not retain the Metal R1 module")
+        load_r0 = getattr(self.evaluator, "_load_metal_r0_module", None)
+        if load_r0 is not None:
+            load_r0()
+        m0_contract = model_data.get("execution_contracts", {}).get("M0")
+        load_m0 = getattr(self.evaluator, "_load_metal_m0_module", None)
+        if m0_contract and load_m0 is not None:
+            from .metal_codegen import metal_m0_metadata, render_jit_m0_metal_source
+
+            m0 = metal_m0_metadata(m0_contract)
+            load_m0(
+                render_jit_m0_metal_source(m0_contract),
+                m0["channels"],
+                m0["input_components"],
+                m0["output_components"],
+                m0["term_count"],
+            )
+        load_m1 = getattr(self.evaluator, "_load_metal_m1_module", None)
+        if m0_contract and load_m1 is not None:
+            from .metal_codegen import metal_m1_metadata, render_jit_m1_metal_source
+
+            m1 = metal_m1_metadata(m0_contract)
+            load_m1(
+                render_jit_m1_metal_source(m0_contract),
+                m1["channels"],
+                m1["input_components"],
+                m1["output_components"],
+                m1["term_count"],
+            )
+        self.metal_status = "ready"
+        self.metal_device = self.evaluator._metal_r1_device_name()
+
+    def metal_statistics(self):
+        """Return Metal R0/R1 launch counts and GPU/staging seconds."""
+
+        query = getattr(self.evaluator, "_metal_statistics", None)
+        return dict(query()) if callable(query) else {}
+
     def _configure_jit(
         self,
         *,
@@ -2454,6 +2543,8 @@ class Symmetrix(Calculator):
             self.jit_edge_policy = selected_edge_policy
             self.jit_node_state_policy = selected_node_state_policy
             self.jit_variant_id = selected_variant_id
+            if specialization == "r1" and jit_backend == "host" and self.metal_request:
+                self._configure_metal_r1(model_data)
             if specialization == "r1" and self.low_memory_request:
                 if jit_backend in ("cuda", "hip"):
                     self._configure_low_memory_operator_modules(
