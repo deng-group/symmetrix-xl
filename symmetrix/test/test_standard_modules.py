@@ -242,6 +242,24 @@ def test_host_a1_gates_blas_without_replacing_device_team_gemm():
     assert source.count("typename Kokkos::DefaultExecutionSpace::memory_space") >= 3
 
 
+def test_single_worker_host_batches_dense_linears():
+    h1 = (NATIVE / "mace_kokkos_h1_phi1.cpp").read_text()
+    second_interaction = (NATIVE / "mace_kokkos_second_interaction.cpp").read_text()
+    readout = (NATIVE / "host_batched_readout.hpp").read_text()
+
+    # Multi-worker hosts keep the per-node worker GEMMs; one worker batches
+    # each lm component (H1) and each node type (H2) into whole GEMMs.
+    assert "if (execution_space.concurrency() == 1) {" in h1
+    assert "num_nodes, num_channels, num_channels," in h1
+    assert second_interaction.count("execution_space.concurrency() == 1") == 2
+    assert "symmetrix::host_batched_h2_forward<Precision>(" in second_interaction
+    assert "symmetrix::host_batched_h2_reverse<Precision>(" in second_interaction
+    assert readout.count("symmetrix_blas_gemm<Precision>(") == 4
+    mlp = (NATIVE / "multilayer_perceptron_kokkos.cpp").read_text()
+    assert "if (execution_space.concurrency() == 1) {" in mlp
+    assert mlp.count("symmetrix_blas_gemm<double>(") == 2
+
+
 def test_host_dense_backend_uses_qualified_blas_for_parallel_openmp():
     policy = (NATIVE / "host_worker_blas.hpp").read_text()
     dense = (NATIVE / "host_dense_kernels.hpp").read_text()
