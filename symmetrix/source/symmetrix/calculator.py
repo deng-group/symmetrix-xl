@@ -755,6 +755,7 @@ class Symmetrix(Calculator):
         self.metal_request = bool(metal)
         self.metal_status = "disabled"
         self.metal_device = None
+        self.metal_stages = ()
         if self.metal_request:
             # Fail before any model or kernel setup: Metal is an opt-in Apple
             # GPU backend, and CPU and CUDA selection does not involve it.
@@ -1893,6 +1894,23 @@ class Symmetrix(Calculator):
                 m1["output_components"],
                 m1["term_count"],
             )
+        # Stages without a loaded module, such as M1 for models whose M1
+        # contraction has no standard module, stay on the CPU.
+        evaluator = self.evaluator
+        self.metal_stages = tuple(
+            stage
+            for stage, ready in (
+                ("R0", getattr(evaluator, "_metal_r0_module_ready", lambda: False)()),
+                ("M0", getattr(evaluator, "_metal_m0_module_ready", lambda: False)()),
+                ("R1", True),
+                (
+                    "M1",
+                    getattr(evaluator, "_metal_m1_module_ready", lambda: False)()
+                    and bool(getattr(evaluator, "standard_m1_module_ready", False)),
+                ),
+            )
+            if ready
+        )
         self.metal_status = "ready"
         self.metal_device = self.evaluator._metal_r1_device_name()
 

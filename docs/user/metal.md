@@ -64,7 +64,7 @@ print(atoms.get_potential_energy())
 print(atoms.get_forces()[:3])
 ```
 
-`Symmetrix(..., metal=True)` raises an error if the Metal layer is not available, so a run cannot fall back to the CPU silently. `calc.metal_statistics()` reports per-stage GPU launch counts and times. Any ASE workflow works with this calculator, including molecular dynamics; the `metal=True` and `dtype="float32"` arguments are the only change from the CPU calculator.
+`Symmetrix(..., metal=True)` raises an error if the Metal layer is not available, so a run cannot fall back to the CPU silently. `calc.metal_stages` lists the stages that run on the GPU, for example `('R0', 'M0', 'R1', 'M1')`; any stage not listed runs on the CPU. `calc.metal_statistics()` reports per-stage GPU launch counts and times. Any ASE workflow works with this calculator, including molecular dynamics; the `metal=True` and `dtype="float32"` arguments are the only change from the CPU calculator.
 
 ## Check the installation
 

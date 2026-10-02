@@ -160,6 +160,7 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
 
     assert metal.metal_status == "ready"
     assert metal.metal_device
+    assert metal.metal_stages == ("R0", "M0", "R1", "M1")
     statistics = metal.metal_statistics()
     assert statistics["forward_launches"] >= 1
     assert statistics["reverse_launches"] >= 1
