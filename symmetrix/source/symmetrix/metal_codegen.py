@@ -166,15 +166,157 @@ template <typename T>
 inline void prefetch_read(T) {}
 """
 
-_EDGE_GEOMETRY = re.compile(
-    r"    const float x_over_r = .*?        gradients \+= gradient_offset;\n    \}\n",
-    re.DOTALL,
-)
+_SIMD_WIDTH = 32
+
+# Channel block of the blocked edge kernel: one SIMD lane per channel, so a
+# receiver's adjoint tile is output_components * 32 floats.
+METAL_R1_EDGE_BLOCK_CHANNELS = _SIMD_WIDTH
 
 
-def _edge_geometry(edge_harmonics: int) -> str:
+def _msl_float(value: float) -> str:
+    return f"float({value!r})"
+
+
+def _msl_row_loaders(path_rows, *, channels: int, output_components: int) -> str:
+    """Receiver adjoint rows of each coupling path row.
+
+    ``load_row_k`` combines rows of the receiver's adjoint in device memory for
+    the forward-adjoint and edge owners; ``block_row_k`` reads the same rows
+    from the threadgroup tile of one 32-channel block.
+    """
+
+    block = METAL_R1_EDGE_BLOCK_CHANNELS
+    rendered = []
+    for rows in path_rows:
+        for row in rows:
+            device_terms = "\n        + ".join(
+                f"{_msl_float(term['coefficient'])} * args->output_adjoint["
+                f"(static_cast<ulong>(receiver) * {output_components} + {term['lme']})"
+                f" * {channels} + channel]"
+                for term in row["terms"]
+            )
+            tile_terms = "\n        + ".join(
+                f"{_msl_float(term['coefficient'])} * tile[{term['lme']} * {block} + local]"
+                for term in row["terms"]
+            )
+            for args_type in ("MetalR1SourceArgs", "MetalR1EdgeArgs"):
+                rendered.append(
+                    f"inline float load_row_{row['row']}(\n"
+                    f"    constant {args_type}* args,\n"
+                    "    int receiver,\n"
+                    "    int channel)\n{\n"
+                    f"    return {device_terms};\n}}"
+                )
+            rendered.append(
+                f"inline float block_row_{row['row']}(\n"
+                "    threadgroup const float* tile,\n"
+                "    int local)\n{\n"
+                f"    return {tile_terms};\n}}"
+            )
+    if not rendered:
+        raise ValueError("R1 contract has no coupling rows")
+    return "\n\n".join(rendered)
+
+
+def _msl_edge_owner(
+    path_rows,
+    *,
+    channels: int,
+    edge_harmonics: int,
+    source_harmonics: int,
+    blocked: bool,
+) -> str:
+    """Coordinate adjoint of one edge, mirroring the host edge owner's terms.
+
+    In the per-edge variant the 32 lanes of a SIMD group split the channels
+    and write the edge's force. In the blocked variant lane l owns channel
+    block_base + l, reads receiver rows from the block's tile, and writes the
+    block's partial force plane. ``simd_sum`` reduces the force over lanes.
+    """
+
     count = 3 * edge_harmonics
-    return f"""    const float x_over_r = args->unit_xyz[coordinate_offset];
+    blocks = []
+    for path_index, rows in enumerate(path_rows):
+        statements = [
+            "        {",
+            f"        float radial_value_{path_index} = float(0);",
+            f"        float radial_derivative_{path_index} = float(0);",
+            "        evaluate_radial(",
+            f"            args->radial, edge_type, point, {path_index} * {channels} + channel,",
+            f"            radial_value_{path_index}, radial_derivative_{path_index});",
+        ]
+        for row in rows:
+            r, lm1, lm2 = row["row"], row["lm1"], row["lm2"]
+            adjoint = (
+                f"block_row_{r}(tile, int(lane))"
+                if blocked
+                else f"load_row_{r}(args, receiver, channel)"
+            )
+            statements.extend(
+                [
+                    "        {",
+                    f"        const float weighted_{r} =",
+                    f"            args->neighbor_features[(source_offset + {lm2}) * {channels} + channel]",
+                    f"            * {adjoint};",
+                    f"        const float radial_force_{r} = radial_derivative_{path_index}",
+                    f"            * weighted_{r} * args->harmonics_values[edge_offset + {lm1}];",
+                    f"        const float angular_force_{r} = radial_value_{path_index} * weighted_{r};",
+                    f"        local_force_x += radial_force_{r} * x_over_r",
+                    f"            + angular_force_{r} * gradients[{lm1}];",
+                    f"        local_force_y += radial_force_{r} * y_over_r",
+                    f"            + angular_force_{r} * gradients[{edge_harmonics + lm1}];",
+                    f"        local_force_z += radial_force_{r} * z_over_r",
+                    f"            + angular_force_{r} * gradients[{2 * edge_harmonics + lm1}];",
+                    "        }",
+                ]
+            )
+        statements.append("        }")
+        blocks.append("\n".join(statements))
+    if blocked:
+        name = "r1_edge_owner_blocked"
+        parameters = (
+            "    constant MetalR1EdgeArgs* args,\n    int edge,\n    uint lane,\n"
+            "    int block_base,\n    threadgroup const float* tile,\n"
+            "    device float* forces)"
+        )
+        loop = "    {\n        const int channel = block_base + int(lane);"
+        target = "forces"
+    else:
+        name = "r1_edge_owner"
+        parameters = (
+            "    constant MetalR1EdgeArgs* args,\n    int edge,\n    uint lane)"
+        )
+        loop = (
+            f"    for (int channel = int(lane); channel < {channels}; "
+            f"channel += {_SIMD_WIDTH}) {{"
+        )
+        target = "args->directed_forces"
+    body = "\n".join(blocks)
+    return f"""void {name}(
+{parameters}
+{{
+    if (!edge_is_active(args->cutoff, args->radius[edge]))
+        return;
+    const int receiver = args->edge_receivers[edge];
+    const int source = args->neigh_indices[edge];
+    const ulong coordinate_offset =
+        static_cast<ulong>(3) * edge;
+    const ulong edge_offset =
+        static_cast<ulong>(edge) * {edge_harmonics};
+    const ulong gradient_offset =
+        static_cast<ulong>(3) * edge_offset;
+    const ulong source_offset =
+        static_cast<ulong>(source) * {source_harmonics};
+    const int receiver_type =
+        args->type_to_active[args->node_types[receiver]];
+    const int source_type =
+        args->type_to_active[args->neigh_types[edge]];
+    const int edge_type = pair_type(
+        receiver_type, source_type,
+        static_cast<int>(args->active_type_count));
+    const EvaluationPoint point = evaluation_point(
+        args->radial, args->radius[edge]);
+    const float x_over_r = args->unit_xyz[coordinate_offset];
     const float y_over_r = args->unit_xyz[coordinate_offset + 1];
     const float z_over_r = args->unit_xyz[coordinate_offset + 2];
     float gradients[{count}];
@@ -185,123 +327,21 @@ def _edge_geometry(edge_harmonics: int) -> str:
         direct_harmonic_gradients(
             x_over_r, y_over_r, z_over_r, args->radius[edge], gradients);
     }}
-"""
-
-
-_SIMD_WIDTH = 32
-
-
-def _simdgroup_edge_owner(source: str, channels: int) -> str:
-    """Split one edge's channel loop across the lanes of a SIMD group.
-
-    Lanes read consecutive channels, so feature, adjoint, and spline loads
-    coalesce; the force components are reduced with ``simd_sum``. Every lane of
-    a SIMD group shares one edge, so the early return for inactive edges is
-    uniform across the group.
-    """
-
-    edits = (
-        (
-            "void r1_edge_owner(\n    constant MetalR1EdgeArgs* args,\n    int edge)",
-            "void r1_edge_owner(\n    constant MetalR1EdgeArgs* args,\n    int edge,\n"
-            "    uint lane)",
-        ),
-        (
-            f"    for (int channel = 0; channel < {channels}; ++channel) {{",
-            f"    for (int channel = int(lane); channel < {channels}; "
-            f"channel += {_SIMD_WIDTH}) {{",
-        ),
-        (
-            "    args->directed_forces[coordinate_offset] -= "
-            "static_cast<float>(local_force_x);\n"
-            "    args->directed_forces[coordinate_offset + 1] -= "
-            "static_cast<float>(local_force_y);\n"
-            "    args->directed_forces[coordinate_offset + 2] -= "
-            "static_cast<float>(local_force_z);",
-            "    local_force_x = simd_sum(local_force_x);\n"
-            "    local_force_y = simd_sum(local_force_y);\n"
-            "    local_force_z = simd_sum(local_force_z);\n"
-            "    if (lane == 0) {\n"
-            "        args->directed_forces[coordinate_offset] -= local_force_x;\n"
-            "        args->directed_forces[coordinate_offset + 1] -= local_force_y;\n"
-            "        args->directed_forces[coordinate_offset + 2] -= local_force_z;\n"
-            "    }",
-        ),
-    )
-    for old, new in edits:
-        if source.count(old) != 1:
-            raise ValueError(f"unexpected R1 edge-owner structure near {old[:40]!r}")
-        source = source.replace(old, new)
-    return source
-
-
-_EDGE_LOADER = re.compile(
-    r"inline float load_row_(\d+)\(\n    constant MetalR1EdgeArgs\* args,\n"
-    r"    int receiver,\n    int channel\)\n\{\n(.*?)\n\}",
-    re.DOTALL,
-)
-_ADJOINT_READ = re.compile(
-    r"args->output_adjoint\[\(static_cast<ulong>\(receiver\) \* \d+ \+ (\d+)\)"
-    r" \* (\d+) \+ channel\]"
-)
-
-# Channel block of the blocked edge kernel: one SIMD lane per channel, so a
-# receiver's adjoint tile is output_components * 32 floats.
-METAL_R1_EDGE_BLOCK_CHANNELS = _SIMD_WIDTH
-
-
-def _blocked_edge_loaders(loaders: str) -> str:
-    """Row loaders reading one 32-channel block of a receiver's adjoint tile."""
-
-    rendered = []
-    for row, body in _EDGE_LOADER.findall(loaders):
-        body, reads = _ADJOINT_READ.subn(
-            rf"tile[\1 * {METAL_R1_EDGE_BLOCK_CHANNELS} + local]", body
-        )
-        if reads == 0 or "args->" in body or "receiver" in body:
-            raise ValueError(f"unexpected R1 edge row loader {row}")
-        rendered.append(
-            f"inline float block_row_{row}(\n"
-            "    threadgroup const float* tile,\n"
-            "    int local)\n{\n" + body.replace("channel", "local") + "\n}"
-        )
-    if not rendered:
-        raise ValueError("R1 source has no edge row loaders")
-    return "\n\n".join(rendered)
-
-
-def _blocked_edge_owner(edge_owner: str, channels: int) -> str:
-    """Edge owner for one 32-channel block; lane l owns channel base + l and
-    the block's partial force is written to its own force plane."""
-
-    edits = (
-        (
-            "void r1_edge_owner(\n    constant MetalR1EdgeArgs* args,\n    int edge,\n"
-            "    uint lane)",
-            "void r1_edge_owner_blocked(\n    constant MetalR1EdgeArgs* args,\n"
-            "    int edge,\n    uint lane,\n    int block_base,\n"
-            "    threadgroup const float* tile,\n    device float* forces)",
-        ),
-        (
-            f"    for (int channel = int(lane); channel < {channels}; "
-            f"channel += {_SIMD_WIDTH}) {{",
-            "    {\n        const int channel = block_base + int(lane);",
-        ),
-    )
-    owner = edge_owner
-    for old, new in edits:
-        if owner.count(old) != 1:
-            raise ValueError(f"unexpected R1 edge-owner structure near {old[:40]!r}")
-        owner = owner.replace(old, new)
-    owner, loads = re.subn(
-        r"load_row_(\d+)\(args, receiver, channel\)",
-        r"block_row_\1(tile, int(lane))",
-        owner,
-    )
-    owner, writes = re.subn(r"args->directed_forces\[", "forces[", owner)
-    if loads == 0 or writes != 3:
-        raise ValueError("unexpected R1 edge-owner structure for channel blocks")
-    return owner
+    float local_force_x = float(0);
+    float local_force_y = float(0);
+    float local_force_z = float(0);
+{loop}
+{body}
+    }}
+    local_force_x = simd_sum(local_force_x);
+    local_force_y = simd_sum(local_force_y);
+    local_force_z = simd_sum(local_force_z);
+    if (lane == 0) {{
+        {target}[coordinate_offset] -= local_force_x;
+        {target}[coordinate_offset + 1] -= local_force_y;
+        {target}[coordinate_offset + 2] -= local_force_z;
+    }}
+}}"""
 
 
 def _to_msl(source: str) -> str:
@@ -385,20 +425,16 @@ def render_jit_r1_metal_source(contract: dict) -> str:
         output_components=output_components,
         channel_tile=1,
     )
-    edge, replaced = _EDGE_GEOMETRY.subn(
-        _edge_geometry(edge_harmonics),
-        _host._render_edge_owner(
-            path_rows,
-            channels=channels,
-            edge_harmonics=edge_harmonics,
-            source_harmonics=source_harmonics,
-        ),
+    loaders_msl = _msl_row_loaders(
+        path_rows, channels=channels, output_components=output_components
     )
-    if replaced != 1:
-        raise ValueError("unexpected R1 edge-owner geometry preamble")
-    loaders = _host._render_row_loaders(path_rows, channels, output_components)
-    loaders_msl = _to_msl(loaders)
-    edge_msl = _simdgroup_edge_owner(_to_msl(edge), channels)
+    edge_msl = _msl_edge_owner(
+        path_rows,
+        channels=channels,
+        edge_harmonics=edge_harmonics,
+        source_harmonics=source_harmonics,
+        blocked=False,
+    )
     tile_floats = output_components * channels
 
     kernels = f"""
@@ -484,8 +520,13 @@ kernel void symmetrix_r1_edge_blocked(
             edge_msl,
             *(
                 (
-                    _blocked_edge_loaders(loaders_msl),
-                    _blocked_edge_owner(edge_msl, channels),
+                    _msl_edge_owner(
+                        path_rows,
+                        channels=channels,
+                        edge_harmonics=edge_harmonics,
+                        source_harmonics=source_harmonics,
+                        blocked=True,
+                    ),
                 )
                 if blocked
                 else ()
