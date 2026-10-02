@@ -27,6 +27,10 @@ on:
     - metal
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   metal:
     runs-on: macos-15
@@ -52,17 +56,12 @@ jobs:
         cmake -S libsymmetrix/source/metal -B build-metal-selftest -G Ninja \
           -DCMAKE_BUILD_TYPE=Release
         cmake --build build-metal-selftest --target symmetrix_metal_selftest
-        if python - <<'EOF'
-        import ctypes, sys
-        objc = ctypes.CDLL("/usr/lib/libobjc.dylib")
-        metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
-        metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
-        sys.exit(0 if metal.MTLCreateSystemDefaultDevice() else 1)
-        EOF
-        then
-          ./build-metal-selftest/symmetrix_metal_selftest
-        else
-          echo "No Metal device on this runner; skipping the runtime self-test."
+        if ! ./build-metal-selftest/symmetrix_metal_selftest | tee selftest.log; then
+          if grep -q "^Metal unavailable" selftest.log; then
+            echo "::notice::No Metal device on this runner; the runtime self-test was skipped."
+          else
+            exit 1
+          fi
         fi
     - name: Build and install Symmetrix with the Metal layer
       run: |
