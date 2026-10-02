@@ -75,6 +75,9 @@ struct KernelLaunchProfileDiagnostic {
     bool calibration_permitted = false;
 };
 
+// True when this build includes the Apple Metal execution layer.
+bool symmetrix_metal_supported();
+
 template <typename Precision>
 class MACEKokkos {
     KokkosLiveObjectGuard kokkos_live_object_guard;

@@ -2629,6 +2629,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
 
 void bind_mace_kokkos(py::module_ &m)
 {
+    m.def("_metal_supported", &symmetrix_metal_supported,
+        "Return whether this build includes the Apple Metal execution layer.");
     bind_mace_kokkos<double>(m, "MACEKokkos");
     bind_mace_kokkos<float>(m, "MACEKokkosFloat");
 }

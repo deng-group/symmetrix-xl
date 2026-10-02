@@ -1598,6 +1598,15 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
     return values;
 }
 
+bool symmetrix_metal_supported()
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    return true;
+#else
+    return false;
+#endif
+}
+
 template <typename Precision>
 std::string MACEKokkos<Precision>::metal_r1_device_name() const
 {

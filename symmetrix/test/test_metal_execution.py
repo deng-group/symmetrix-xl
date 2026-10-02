@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import re
@@ -204,3 +205,14 @@ def test_metal_mapped_views_follow_reallocation(omat_small_model):
         assert abs(e_metal - e_host) / len(atoms) < 1e-5
         np.testing.assert_allclose(f_metal, f_host, atol=1e-4)
     assert metal.metal_statistics()["mapped_views"] >= 1
+
+
+def test_metal_is_opt_in_and_rejected_off_macos(monkeypatch):
+    from symmetrix import Symmetrix
+
+    # Disabled by default on every platform.
+    assert inspect.signature(Symmetrix).parameters["metal"].default is False
+    # Off macOS the request fails before any model is read.
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(ValueError, match="only available on macOS"):
+        Symmetrix("model-is-not-read.json", dtype="float32", metal=True)

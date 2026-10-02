@@ -8,6 +8,7 @@ work for the U. S. Government, and is not subject to copyright.
 import json
 import logging
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -754,6 +755,20 @@ class Symmetrix(Calculator):
         self.metal_request = bool(metal)
         self.metal_status = "disabled"
         self.metal_device = None
+        if self.metal_request:
+            # Fail before any model or kernel setup: Metal is an opt-in Apple
+            # GPU backend, and CPU and CUDA selection does not involve it.
+            if sys.platform != "darwin":
+                raise ValueError(
+                    "metal=True is only available on macOS with an Apple GPU; "
+                    "on Linux use the CPU or CUDA backend (selected with "
+                    "SYMMETRIX_BACKEND) and leave metal unset"
+                )
+            if not getattr(symmetrix, "_metal_supported", lambda: False)():
+                raise RuntimeError(
+                    "metal=True requires a build with the Metal layer "
+                    "(SYMMETRIX_METAL=ON); see docs/user/metal.md"
+                )
         if self.metal_request and dtype != "float32":
             raise ValueError("metal=True requires dtype='float32'; Metal has no FP64")
         self.dispersion = bool(dispersion)
