@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 from symmetrix.execution_contract import (
     normalize_jit_r1_contract,
@@ -467,3 +468,74 @@ def test_static_aot_authoring_surface_is_retired():
         assert not (ROOT / "libsymmetrix" / "tools" / filename).exists()
     assert not (NATIVE / "generated").exists()
     assert not (ROOT / "benchmarks" / "execution_generated_stream_fixture.cpp").exists()
+
+
+_SINGLE_WORKER_PARITY_SCRIPT = r"""
+import json, sys
+import numpy as np
+from ase import Atoms
+from compact_r1_model import foundation_r1_test_model
+from symmetrix import Symmetrix
+
+contract = json.loads(open(sys.argv[1]).read())
+model_path = sys.argv[2]
+with open(model_path, "w") as output:
+    json.dump(foundation_r1_test_model(contract, atomic_numbers=(1, 8)), output)
+rng = np.random.default_rng(7)
+atoms = Atoms(
+    ["H", "O"] * 6,
+    positions=rng.uniform(0.0, 6.0, size=(12, 3)),
+    cell=[6.0, 6.0, 6.0],
+    pbc=True,
+)
+results = {}
+for use_kokkos in (True, False):
+    kwargs = {"streamed_edges": "generic"} if use_kokkos else {}
+    atoms.calc = Symmetrix(model_path, use_kokkos=use_kokkos, dtype="float64", **kwargs)
+    results[str(use_kokkos)] = {
+        "energy": float(atoms.get_potential_energy()),
+        "forces": atoms.get_forces().tolist(),
+        "stress": atoms.get_stress().tolist(),
+    }
+print("PARITY=" + json.dumps(results))
+"""
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_kokkos_host_workers_match_generic_evaluator(tmp_path, threads):
+    pytest.importorskip("symmetrix.symmetrix")
+    # One worker takes the batched whole-system host paths; compare it and a
+    # multi-worker run against the independent generic evaluator.
+    script = tmp_path / "parity.py"
+    script.write_text(_SINGLE_WORKER_PARITY_SCRIPT)
+    contract = (
+        Path(__file__).resolve().parent
+        / "data"
+        / "execution_contracts"
+        / "jit_r1_mace_off23_small_contract.json"
+    )
+    environment = dict(
+        os.environ,
+        KOKKOS_NUM_THREADS=str(threads),
+        OMP_NUM_THREADS=str(threads),
+        OPENBLAS_NUM_THREADS="1",
+        PYTHONPATH=os.pathsep.join(
+            [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH", "")]
+        ),
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script), str(contract), str(tmp_path / "model.json")],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    line = next(
+        line for line in completed.stdout.splitlines() if line.startswith("PARITY=")
+    )
+    results = json.loads(line.partition("=")[2])
+    kokkos, generic = results["True"], results["False"]
+    assert kokkos["energy"] == pytest.approx(generic["energy"], rel=1e-10, abs=1e-10)
+    np.testing.assert_allclose(kokkos["forces"], generic["forces"], atol=1e-9)
+    np.testing.assert_allclose(kokkos["stress"], generic["stress"], atol=1e-9)
