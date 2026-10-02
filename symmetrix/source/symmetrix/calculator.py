@@ -976,6 +976,7 @@ class Symmetrix(Calculator):
         self._native_model_type = (
             json_model_type if json_model_type is not None else "MACE"
         )
+        self._require_metal_model_family()
         MACE = self._native_evaluator_class(
             json_model_type if json_model_type is not None else "MACE",
             dtype,
@@ -1029,6 +1030,7 @@ class Symmetrix(Calculator):
                 self._model_single_layer_readout,
             )
         )
+        self._require_metal_model_family()
         selected_head = getattr(self.evaluator, "selected_head", "")
         self.head = selected_head or None
         self.available_heads = list(getattr(self.evaluator, "available_heads", []))
@@ -2639,6 +2641,24 @@ class Symmetrix(Calculator):
             return None
         except (OSError, ValueError, TypeError, AttributeError):
             return None
+
+    def _require_metal_model_family(self):
+        if not self.metal_request:
+            return
+        if self._native_model_type == "MACE" and not self._model_single_layer_readout:
+            return
+        # Only two-interaction standard MACE has been qualified on the Metal
+        # stages; other families would reach them untested.
+        family = (
+            "single-layer MACE"
+            if self._native_model_type == "MACE"
+            else self._native_model_type
+        )
+        raise ValueError(
+            "metal=True supports two-interaction standard MACE models; "
+            f"{family} is not qualified on the Metal backend. Leave metal unset "
+            "to evaluate it on the CPU."
+        )
 
     def _raise_if_macefield_checkpoint(self, model_file):
         try:

@@ -220,6 +220,20 @@ def test_metal_is_opt_in_and_rejected_off_macos(monkeypatch):
         Symmetrix("model-is-not-read.json", dtype="float32", metal=True)
 
 
+@pytest.mark.parametrize("model_type", ["MACEField", "MACE_Nonlinear"])
+def test_metal_rejects_unqualified_model_families(model_type, tmp_path):
+    available, reason = _metal_extension_available()
+    if not available:
+        pytest.skip(reason)
+    from symmetrix import Symmetrix
+
+    # The family is read from the JSON header before any weights are loaded.
+    model = tmp_path / "header-only.json"
+    model.write_text(json.dumps({"model_type": model_type}))
+    with pytest.raises(ValueError, match=f"{model_type} is not qualified"):
+        Symmetrix(model, dtype="float32", metal=True)
+
+
 def test_metal_r0_reverse_chunks_match_one_chunk(omat_small_model, tmp_path):
     import subprocess
 
