@@ -20,6 +20,18 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint64_t threadgroup_size = 128;
 constexpr std::uint64_t simd_width = 32;
 constexpr std::int32_t max_degree = 3;
+// Edges per R0 reverse chunk: bounds the GPU-only harmonic and gradient
+// workspaces to 2M edges, 512 MB at l_max = 3. SYMMETRIX_METAL_R0_REVERSE_CHUNK
+// overrides it so tests can exercise multi-chunk execution on small graphs.
+std::size_t reverse_chunk_size()
+{
+    static const std::size_t size = [] {
+        const char* value = std::getenv("SYMMETRIX_METAL_R0_REVERSE_CHUNK");
+        const long long parsed = value != nullptr ? std::atoll(value) : 0;
+        return parsed > 0 ? static_cast<std::size_t>(parsed) : std::size_t(1) << 21;
+    }();
+    return size;
+}
 
 // Device pointers are 64-bit GPU addresses; the scalar header is 48 bytes so
 // the pointer block starts 8-byte aligned in both layouts.
@@ -35,7 +47,8 @@ struct R0Args {
     float h;
     float x0;
     float cutoff;
-    std::uint32_t reserved;
+    // First edge of the current reverse chunk; workspaces are chunk-relative.
+    std::uint32_t edge_begin;
     std::uint64_t node_types;
     std::uint64_t num_neigh;
     std::uint64_t first_neigh;
@@ -79,7 +92,7 @@ struct R0Args {
     float h;
     float x0;
     float cutoff;
-    uint reserved;
+    uint edge_begin;
     device const int* node_types;
     device const int* num_neigh;
     device const int* first_neigh;
@@ -174,9 +187,10 @@ SYMMETRIX_R0_FORWARD(3)
 template <uint L>
 kernel void symmetrix_r0_harmonics(
     constant R0Args& a [[buffer(0)]],
-    uint edge [[thread_position_in_grid]])
+    uint local [[thread_position_in_grid]])
 {
     constexpr uint size = (L + 1) * (L + 1);
+    const uint edge = a.edge_begin + local;
     if (edge >= a.num_edges)
         return;
     const float3 u = float3(
@@ -184,8 +198,8 @@ kernel void symmetrix_r0_harmonics(
     float values[size];
     float gradients[3 * size];
     symmetrix_sph_values_gradients<int(L)>(u, a.radius[edge], values, gradients);
-    device float* Y = a.harmonics_out + ulong(edge) * size;
-    device float* G = a.gradients_out + ulong(edge) * 3 * size;
+    device float* Y = a.harmonics_out + ulong(local) * size;
+    device float* G = a.gradients_out + ulong(local) * 3 * size;
     for (uint index = 0; index < size; ++index)
         Y[index] = values[index];
     for (uint index = 0; index < 3 * size; ++index)
@@ -248,7 +262,8 @@ kernel void symmetrix_r0_reverse(
     uint lane [[thread_index_in_simdgroup]])
 {
     constexpr uint size = (L + 1) * (L + 1);
-    const uint edge = flat / 32u;
+    const uint local = flat / 32u;
+    const uint edge = a.edge_begin + local;
     if (edge >= a.num_edges)
         return;
     const int receiver = a.edge_receivers[edge];
@@ -262,8 +277,8 @@ kernel void symmetrix_r0_reverse(
     const float ux = a.unit_xyz[3 * edge];
     const float uy = a.unit_xyz[3 * edge + 1];
     const float uz = a.unit_xyz[3 * edge + 2];
-    device const float* Y = a.harmonics_out + ulong(edge) * size;
-    device const float* G = a.gradients_out + ulong(edge) * 3 * size;
+    device const float* Y = a.harmonics_out + ulong(local) * size;
+    device const float* G = a.gradients_out + ulong(local) * 3 * size;
     device const float* adjoint = a.adjoint + ulong(receiver) * size * a.channels;
     float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     for (uint channel = lane; channel < a.channels; channel += 32u) {
@@ -577,8 +592,10 @@ void MetalR0Module::coordinate_reverse(
                 unit_xyz[3*edge+k] = static_cast<float>(coordinates_are_unit
                     ? xyz[3*edge+k] : xyz[3*edge+k]/graph.radius[edge]);
     }
-    // GPU-only harmonic workspaces; no host storage or transfer.
-    const std::size_t harmonic_values = edges*static_cast<std::size_t>(harmonic_count);
+    // GPU-only harmonic workspaces, bounded by processing the edges in
+    // chunks; no host storage or transfer.
+    const std::size_t chunk = std::min(edges, reverse_chunk_size());
+    const std::size_t harmonic_values = chunk*static_cast<std::size_t>(harmonic_count);
     Buffer& Y = m.staging->slot("harmonics", harmonic_values*sizeof(float));
     Buffer& gradients = m.staging->slot("gradients", 3*harmonic_values*sizeof(float));
     const DeviceSpan adjoint = m.staging->input("adjoint", output_adjoint,
@@ -594,24 +611,31 @@ void MetalR0Module::coordinate_reverse(
             &receivers, &unit, adjoint.buffer})
         batch.use_buffer(*buffer, false);
     batch.use_buffer(Y, true).use_buffer(gradients, true).use_buffer(forces, true);
-    // The serial encoder orders the harmonic pass before the edge pass.
-    batch.set_value(0, args)
-        .dispatch_threads(m.harmonics[Impl::degree_of(harmonic_count)],
-            {edges}, {threadgroup_size});
-    if (profiling_enabled()) {
-        const double harmonics_seconds = batch.submit_and_wait().gpu_seconds;
-        m.statistics.gpu_seconds += harmonics_seconds;
-        m.statistics.reverse_seconds += harmonics_seconds;
-        m.statistics.harmonics_seconds += harmonics_seconds;
-        batch = m.device.begin();
-        m.stage_graph(graph, spline, batch, args);
-        for (const Buffer* buffer : std::initializer_list<const Buffer*>{
-                &receivers, &unit, adjoint.buffer, &Y, &gradients})
-            batch.use_buffer(*buffer, false);
-        batch.use_buffer(forces, true).set_value(0, args);
+    // The serial encoder orders each chunk's harmonic pass before its edge
+    // pass, and both before the next chunk overwrites the workspaces.
+    const int degree = Impl::degree_of(harmonic_count);
+    for (std::size_t begin = 0; begin < edges; begin += chunk) {
+        const std::size_t count = std::min(chunk, edges-begin);
+        args.edge_begin = static_cast<std::uint32_t>(begin);
+        args.num_edges = static_cast<std::uint32_t>(begin+count);
+        batch.set_value(0, args)
+            .dispatch_threads(m.harmonics[degree], {count}, {threadgroup_size});
+        if (profiling_enabled()) {
+            const double harmonics_seconds = batch.submit_and_wait().gpu_seconds;
+            m.statistics.gpu_seconds += harmonics_seconds;
+            m.statistics.reverse_seconds += harmonics_seconds;
+            m.statistics.harmonics_seconds += harmonics_seconds;
+            batch = m.device.begin();
+            m.stage_graph(graph, spline, batch, args);
+            args.edge_begin = static_cast<std::uint32_t>(begin);
+            args.num_edges = static_cast<std::uint32_t>(begin+count);
+            for (const Buffer* buffer : std::initializer_list<const Buffer*>{
+                    &receivers, &unit, adjoint.buffer, &Y, &gradients})
+                batch.use_buffer(*buffer, false);
+            batch.use_buffer(forces, true).set_value(0, args);
+        }
+        batch.dispatch_threads(m.reverse[degree], {count*simd_width}, {threadgroup_size});
     }
-    batch.dispatch_threads(m.reverse[Impl::degree_of(harmonic_count)],
-        {edges*simd_width}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
     const double gpu_seconds = batch.submit_and_wait().gpu_seconds;
     m.statistics.gpu_seconds += gpu_seconds;

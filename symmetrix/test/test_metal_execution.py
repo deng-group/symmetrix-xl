@@ -216,3 +216,31 @@ def test_metal_is_opt_in_and_rejected_off_macos(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     with pytest.raises(ValueError, match="only available on macOS"):
         Symmetrix("model-is-not-read.json", dtype="float32", metal=True)
+
+
+def test_metal_r0_reverse_chunks_match_one_chunk(omat_small_model, tmp_path):
+    import subprocess
+
+    # The chunk size is read once per process, so compare in fresh processes.
+    script = tmp_path / "chunks.py"
+    script.write_text(
+        "import sys, numpy as np\n"
+        "from ase.spacegroup import crystal\n"
+        "from symmetrix import Symmetrix\n"
+        "a = 3.905\n"
+        "atoms = crystal(['Sr','Ti','O'], basis=[(0,0,0),(0.5,0.5,0.5),(0.5,0.5,0)],"
+        " spacegroup=221, cellpar=[a,a,a,90,90,90]).repeat((2,2,2))\n"
+        "atoms.rattle(stdev=0.05, seed=3)\n"
+        f"atoms.calc = Symmetrix({str(omat_small_model)!r}, species=[8,22,38],"
+        " dtype='float32', metal=True)\n"
+        "np.save(sys.argv[1], atoms.get_forces())\n"
+    )
+    results = {}
+    for chunk in ("1000", "0"):
+        output = tmp_path / f"forces_{chunk}.npy"
+        environment = dict(os.environ, SYMMETRIX_METAL_R0_REVERSE_CHUNK=chunk)
+        subprocess.run(
+            [sys.executable, str(script), str(output)], check=True, env=environment
+        )
+        results[chunk] = np.load(output)
+    np.testing.assert_allclose(results["1000"], results["0"], atol=1e-6)
