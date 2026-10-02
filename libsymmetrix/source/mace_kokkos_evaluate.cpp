@@ -70,10 +70,13 @@ void MACEKokkos<Precision>::reduce_node_forces(
                 Kokkos::RangePolicy<decltype(factorized_execution_space)>(
                     factorized_execution_space, 0, 1),
                 [=] (int) {
-                    for (int edge=0; edge<num_edges; ++edge) {
-                        const int receiver = edge_receivers(edge);
-                        const int source = edge_sources(edge);
-                        for (int component=0; component<3; ++component) {
+                    const std::size_t edges = static_cast<std::size_t>(num_edges);
+                    for (std::size_t edge=0; edge<edges; ++edge) {
+                        const std::size_t receiver =
+                            static_cast<std::size_t>(edge_receivers(edge));
+                        const std::size_t source =
+                            static_cast<std::size_t>(edge_sources(edge));
+                        for (std::size_t component=0; component<3; ++component) {
                             const double force = directed_forces(3*edge+component);
                             reduced_forces(3*source+component) += force;
                             reduced_forces(3*receiver+component) -= force;
