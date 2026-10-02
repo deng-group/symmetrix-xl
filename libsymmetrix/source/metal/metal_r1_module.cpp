@@ -108,10 +108,10 @@ struct MetalR1Module::Impl {
     MetalR1RadialSpline spline(
         const SymmetrixJitHostRadialSplineV2& radial, CommandBatch& batch)
     {
-        const std::size_t count = static_cast<std::size_t>(radial.edge_types)
-            *radial.intervals*4u*radial.functions;
-        const Buffer& coefficients =
-            staging->persistent(radial.coefficients, count*sizeof(float));
+        const Buffer& coefficients = staging->persistent_spline4(
+            static_cast<const float*>(radial.coefficients),
+            static_cast<std::size_t>(radial.edge_types)*radial.intervals,
+            radial.functions);
         batch.use_buffer(coefficients, false);
         return {
             radial.edge_types,

@@ -202,7 +202,7 @@ public:
     {
         auto cached = std::find_if(tables_.begin(), tables_.end(),
             [&](const Table& entry) {
-                return entry.host == host && entry.bytes == bytes;
+                return !entry.interleaved && entry.host == host && entry.bytes == bytes;
             });
         if (cached != tables_.end())
             return cached->buffer;
@@ -210,6 +210,32 @@ public:
             fail("persistent table is empty");
         Table entry{host, bytes, device_.allocate(bytes)};
         std::memcpy(entry.buffer.contents(), host, bytes);
+        tables_.push_back(std::move(entry));
+        return tables_.back().buffer;
+    }
+
+    // Cubic spline coefficients stored [block, 4, functions] on the host are
+    // interleaved to [block, functions, 4] once, so a kernel fetches the four
+    // coefficients of one function with a single float4 load.
+    const Buffer& persistent_spline4(
+        const float* host, const std::size_t blocks, const std::size_t functions)
+    {
+        const std::size_t bytes = blocks*4*functions*sizeof(float);
+        auto cached = std::find_if(tables_.begin(), tables_.end(),
+            [&](const Table& entry) {
+                return entry.interleaved && entry.host == host && entry.bytes == bytes;
+            });
+        if (cached != tables_.end())
+            return cached->buffer;
+        if (host == nullptr || bytes == 0)
+            fail("spline coefficient table is empty");
+        Table entry{host, bytes, device_.allocate(bytes), true};
+        float* out = entry.buffer.data<float>();
+        for (std::size_t block = 0; block < blocks; ++block)
+            for (std::size_t k = 0; k < 4; ++k)
+                for (std::size_t function = 0; function < functions; ++function)
+                    out[(block*functions+function)*4+k] =
+                        host[(block*4+k)*functions+function];
         tables_.push_back(std::move(entry));
         return tables_.back().buffer;
     }
@@ -224,6 +250,7 @@ private:
         const void* host = nullptr;
         std::size_t bytes = 0;
         Buffer buffer;
+        bool interleaved = false;
     };
 
     struct CopyBack {

@@ -31,7 +31,7 @@ struct MetalR1RadialSpline {
     float h;
     float x0;
     uint reserved;
-    device const float* coefficients;
+    device const float4* coefficients;
 };
 
 struct MetalR1ForwardArgs {
@@ -118,15 +118,16 @@ inline EvaluationPoint evaluation_point(
     return {interval, x, xx, xx * x};
 }
 
+// Coefficients are interleaved [edge_type, interval, function] float4 so one
+// load fetches the cubic of one radial function.
 inline ulong radial_index(
     constant MetalR1RadialSpline& radial,
     int edge_type,
     int interval,
-    int coefficient,
     int function)
 {
-    return (((ulong(edge_type) * radial.intervals + ulong(interval))
-        * 4u + ulong(coefficient)) * radial.functions + ulong(function));
+    return (ulong(edge_type) * radial.intervals + ulong(interval))
+        * radial.functions + ulong(function);
 }
 
 inline Scalar evaluate_radial(
@@ -135,13 +136,9 @@ inline Scalar evaluate_radial(
     thread const EvaluationPoint& point,
     int function)
 {
-    const ulong base = radial_index(radial, edge_type, point.interval, 0, function);
-    const ulong stride = radial.functions;
-    const Scalar c0 = radial.coefficients[base];
-    const Scalar c1 = radial.coefficients[base + stride];
-    const Scalar c2 = radial.coefficients[base + 2 * stride];
-    const Scalar c3 = radial.coefficients[base + 3 * stride];
-    return c0 + c1 * point.x + c2 * point.xx + c3 * point.xxx;
+    const float4 c =
+        radial.coefficients[radial_index(radial, edge_type, point.interval, function)];
+    return c.x + c.y * point.x + c.z * point.xx + c.w * point.xxx;
 }
 
 inline void evaluate_radial(
@@ -152,14 +149,10 @@ inline void evaluate_radial(
     thread Scalar& value,
     thread Scalar& derivative)
 {
-    const ulong base = radial_index(radial, edge_type, point.interval, 0, function);
-    const ulong stride = radial.functions;
-    const Scalar c0 = radial.coefficients[base];
-    const Scalar c1 = radial.coefficients[base + stride];
-    const Scalar c2 = radial.coefficients[base + 2 * stride];
-    const Scalar c3 = radial.coefficients[base + 3 * stride];
-    value = c0 + c1 * point.x + c2 * point.xx + c3 * point.xxx;
-    derivative = c1 + c2 * (2.0f * point.x) + c3 * (3.0f * point.xx);
+    const float4 c =
+        radial.coefficients[radial_index(radial, edge_type, point.interval, function)];
+    value = c.x + c.y * point.x + c.z * point.xx + c.w * point.xxx;
+    derivative = c.y + c.z * (2.0f * point.x) + c.w * (3.0f * point.xx);
 }
 
 inline int pair_type(int left, int right, int type_count)

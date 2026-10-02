@@ -87,7 +87,8 @@ struct R0Args {
     device const int* type_to_active;
     device const int* edge_receivers;
     device const float* radius;
-    device const float* coefficients;
+    // [edge_type, interval, function] float4 of cubic coefficients.
+    device const float4* coefficients;
     device const float* harmonics;
     device const float* density_scale;
     device const float* unit_xyz;
@@ -116,33 +117,28 @@ inline SplinePoint spline_point(constant R0Args& a, int edge_type, float r)
         x = a.h;
     }
     const float xx = x * x;
-    return {(ulong(edge_type) * a.intervals + ulong(interval)) * 4u * a.functions,
+    return {(ulong(edge_type) * a.intervals + ulong(interval)) * a.functions,
             x, xx, xx * x};
 }
 
-inline uint harmonic_degree_count(uint harmonic_count)
-{
-    uint l = 0;
-    while ((l + 1) * (l + 1) < harmonic_count)
-        ++l;
-    return l + 1;
-}
-
-// One thread owns one (receiver, channel) output row of A0.
+// One thread owns one (receiver, channel) output row of A0. The degree is a
+// template parameter so the harmonic loops unroll and the accumulators stay
+// in registers.
+template <uint L>
 kernel void symmetrix_r0_forward(
     constant R0Args& a [[buffer(0)]],
     uint flat [[thread_position_in_grid]])
 {
+    constexpr uint size = (L + 1) * (L + 1);
     const uint receiver = flat / a.channels;
     if (receiver >= a.num_nodes)
         return;
     const uint channel = flat % a.channels;
-    const uint degrees = harmonic_degree_count(a.harmonic_count);
     const int receiver_type = a.type_to_active[a.node_types[receiver]];
     const int begin = a.first_neigh[receiver];
     const int end = begin + a.num_neigh[receiver];
-    float accumulator[16];
-    for (uint lm = 0; lm < 16; ++lm)
+    float accumulator[size];
+    for (uint lm = 0; lm < size; ++lm)
         accumulator[lm] = 0.0f;
     for (int edge = begin; edge < end; ++edge) {
         const float r = a.radius[edge];
@@ -151,22 +147,27 @@ kernel void symmetrix_r0_forward(
         const int neighbor_type = a.type_to_active[a.neigh_types[edge]];
         const SplinePoint p = spline_point(
             a, receiver_type * int(a.active_type_count) + neighbor_type, r);
-        const ulong harmonic_offset = ulong(edge) * a.harmonic_count;
-        for (uint l = 0; l < degrees; ++l) {
-            const ulong index = p.base + l * a.channels + channel;
-            const float value = a.coefficients[index]
-                + a.coefficients[index + a.functions] * p.x
-                + a.coefficients[index + 2 * a.functions] * p.xx
-                + a.coefficients[index + 3 * a.functions] * p.xxx;
+        device const float* Y = a.harmonics + ulong(edge) * size;
+        for (uint l = 0; l <= L; ++l) {
+            const float4 c = a.coefficients[p.base + l * a.channels + channel];
+            const float value = c.x + c.y * p.x + c.z * p.xx + c.w * p.xxx;
             for (uint lm = l * l; lm < (l + 1) * (l + 1); ++lm)
-                accumulator[lm] += value * a.harmonics[harmonic_offset + lm];
+                accumulator[lm] += value * Y[lm];
         }
     }
     const float scale = a.apply_scale != 0 ? a.density_scale[receiver] : 1.0f;
-    for (uint lm = 0; lm < a.harmonic_count; ++lm)
-        a.output[(ulong(receiver) * a.harmonic_count + lm) * a.channels + channel] =
+    for (uint lm = 0; lm < size; ++lm)
+        a.output[(ulong(receiver) * size + lm) * a.channels + channel] =
             accumulator[lm] * scale;
 }
+
+#define SYMMETRIX_R0_FORWARD(L) \
+    template [[host_name("symmetrix_r0_forward_l" #L)]] kernel void \
+    symmetrix_r0_forward<L>(constant R0Args&, uint);
+SYMMETRIX_R0_FORWARD(0)
+SYMMETRIX_R0_FORWARD(1)
+SYMMETRIX_R0_FORWARD(2)
+SYMMETRIX_R0_FORWARD(3)
 
 // One thread evaluates the harmonics and Cartesian gradients of one edge
 // into GPU-only buffers laid out as the host owner's Y and Y_grad blocks.
@@ -240,11 +241,13 @@ SYMMETRIX_R0_HARMONICS(3)
 
 // One 32-lane SIMD group owns one edge; lanes split the channels so adjoint
 // and spline loads coalesce, and simd_sum reduces the force components.
+template <uint L>
 kernel void symmetrix_r0_reverse(
     constant R0Args& a [[buffer(0)]],
     uint flat [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
+    constexpr uint size = (L + 1) * (L + 1);
     const uint edge = flat / 32u;
     if (edge >= a.num_edges)
         return;
@@ -252,7 +255,6 @@ kernel void symmetrix_r0_reverse(
     const float r = a.radius[edge];
     if (receiver < 0 || !(r < a.cutoff))
         return;
-    const uint degrees = harmonic_degree_count(a.harmonic_count);
     const int receiver_type = a.type_to_active[a.node_types[receiver]];
     const int neighbor_type = a.type_to_active[a.neigh_types[edge]];
     const SplinePoint p = spline_point(
@@ -260,30 +262,22 @@ kernel void symmetrix_r0_reverse(
     const float ux = a.unit_xyz[3 * edge];
     const float uy = a.unit_xyz[3 * edge + 1];
     const float uz = a.unit_xyz[3 * edge + 2];
-    const ulong harmonic_offset = ulong(edge) * a.harmonic_count;
-    const ulong gradient_offset = 3 * harmonic_offset;
-    const ulong adjoint_offset = ulong(receiver) * a.harmonic_count;
-    device const float* Y = a.harmonics_out;
-    device const float* G = a.gradients_out;
+    device const float* Y = a.harmonics_out + ulong(edge) * size;
+    device const float* G = a.gradients_out + ulong(edge) * 3 * size;
+    device const float* adjoint = a.adjoint + ulong(receiver) * size * a.channels;
     float fx = 0.0f, fy = 0.0f, fz = 0.0f;
     for (uint channel = lane; channel < a.channels; channel += 32u) {
-        for (uint l = 0; l < degrees; ++l) {
-            const ulong index = p.base + l * a.channels + channel;
-            const float c1 = a.coefficients[index + a.functions];
-            const float c2 = a.coefficients[index + 2 * a.functions];
-            const float c3 = a.coefficients[index + 3 * a.functions];
-            const float value = a.coefficients[index] + c1 * p.x + c2 * p.xx + c3 * p.xxx;
-            const float derivative = c1 + 2.0f * c2 * p.x + 3.0f * c3 * p.xx;
+        for (uint l = 0; l <= L; ++l) {
+            const float4 c = a.coefficients[p.base + l * a.channels + channel];
+            const float value = c.x + c.y * p.x + c.z * p.xx + c.w * p.xxx;
+            const float derivative = c.y + 2.0f * c.z * p.x + 3.0f * c.w * p.xx;
             for (uint lm = l * l; lm < (l + 1) * (l + 1); ++lm) {
-                const float adjoint =
-                    a.adjoint[(adjoint_offset + lm) * a.channels + channel];
-                const float radial = derivative * Y[harmonic_offset + lm] * adjoint;
-                const float angular = value * adjoint;
-                fx += radial * ux + angular * G[gradient_offset + lm];
-                fy += radial * uy
-                    + angular * G[gradient_offset + a.harmonic_count + lm];
-                fz += radial * uz
-                    + angular * G[gradient_offset + 2 * a.harmonic_count + lm];
+                const float w = adjoint[lm * a.channels + channel];
+                const float radial = derivative * Y[lm] * w;
+                const float angular = value * w;
+                fx += radial * ux + angular * G[lm];
+                fy += radial * uy + angular * G[size + lm];
+                fz += radial * uz + angular * G[2 * size + lm];
             }
         }
     }
@@ -296,6 +290,14 @@ kernel void symmetrix_r0_reverse(
         a.output[3 * edge + 2] = -fz;
     }
 }
+
+#define SYMMETRIX_R0_REVERSE(L) \
+    template [[host_name("symmetrix_r0_reverse_l" #L)]] kernel void \
+    symmetrix_r0_reverse<L>(constant R0Args&, uint, uint);
+SYMMETRIX_R0_REVERSE(0)
+SYMMETRIX_R0_REVERSE(1)
+SYMMETRIX_R0_REVERSE(2)
+SYMMETRIX_R0_REVERSE(3)
 )MSL";
 
 bool profiling_enabled()
@@ -313,8 +315,9 @@ double seconds_since(const Clock::time_point start)
 
 struct MetalR0Module::Impl {
     Device device;
-    Pipeline forward;
-    Pipeline reverse;
+    // Indexed by l_max, like the harmonic pipelines.
+    Pipeline forward[max_degree+1];
+    Pipeline reverse[max_degree+1];
     // Indexed by l_max; harmonics are compile-time sized per pipeline.
     Pipeline harmonics[max_degree+1];
     Pipeline harmonic_values[max_degree+1];
@@ -372,8 +375,8 @@ struct MetalR0Module::Impl {
         Buffer& type_to_active = staging->upload(
             "type_to_active", graph.type_to_active, graph.type_map_count);
         Buffer& radius = staging->upload_narrowed("radius", graph.radius, edges);
-        const Buffer& coefficients = staging->persistent(spline.coefficients,
-            spline.edge_types*spline.intervals*4*spline.functions*sizeof(float));
+        const Buffer& coefficients = staging->persistent_spline4(spline.coefficients,
+            spline.edge_types*spline.intervals, spline.functions);
         for (const Buffer* buffer : std::initializer_list<const Buffer*>{
                 &node_types, &num_neigh, &first_neigh, &neigh_types,
                 &type_to_active, &radius, &coefficients})
@@ -402,17 +405,21 @@ MetalR0Module::MetalR0Module() : impl_(std::make_unique<Impl>())
     impl_->staging = std::make_unique<MetalStaging>(impl_->device, "R0");
     const Library library = impl_->device.compile(
         spherical_harmonics_msl()+r0_kernels, module_compile_options());
-    impl_->forward = impl_->device.pipeline(library, "symmetrix_r0_forward");
-    impl_->reverse = impl_->device.pipeline(library, "symmetrix_r0_reverse");
-    if (impl_->reverse.thread_execution_width() != simd_width)
-        impl_->fail("the reverse kernel requires 32-wide SIMD groups");
     for (int l = 0; l <= max_degree; ++l) {
+        impl_->forward[l] = impl_->device.pipeline(
+            library, "symmetrix_r0_forward_l"+std::to_string(l));
+        impl_->reverse[l] = impl_->device.pipeline(
+            library, "symmetrix_r0_reverse_l"+std::to_string(l));
+        if (impl_->reverse[l].thread_execution_width() != simd_width)
+            impl_->fail("the reverse kernels require 32-wide SIMD groups");
         impl_->harmonics[l] = impl_->device.pipeline(
             library, "symmetrix_r0_harmonics_l"+std::to_string(l));
         impl_->harmonic_values[l] = impl_->device.pipeline(
             library, "symmetrix_harmonic_values_l"+std::to_string(l));
     }
-    for (const Pipeline* pipeline : {&impl_->forward, &impl_->reverse,
+    for (const Pipeline* pipeline : {&impl_->forward[0], &impl_->forward[1],
+            &impl_->forward[2], &impl_->forward[3], &impl_->reverse[0],
+            &impl_->reverse[1], &impl_->reverse[2], &impl_->reverse[3],
             &impl_->harmonics[0], &impl_->harmonics[1], &impl_->harmonics[2],
             &impl_->harmonics[3], &impl_->harmonic_values[0],
             &impl_->harmonic_values[1], &impl_->harmonic_values[2],
@@ -509,7 +516,8 @@ void MetalR0Module::forward(
     batch.use_buffer(*Y.buffer, false).use_buffer(scale, false)
         .use_buffer(*out.buffer, true);
     batch.set_value(0, args)
-        .dispatch_threads(m.forward, {nodes*channels}, {threadgroup_size});
+        .dispatch_threads(m.forward[Impl::degree_of(harmonic_count)],
+            {nodes*channels}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
     const double gpu_seconds = batch.submit_and_wait().gpu_seconds;
     m.statistics.gpu_seconds += gpu_seconds;
@@ -602,7 +610,8 @@ void MetalR0Module::coordinate_reverse(
             batch.use_buffer(*buffer, false);
         batch.use_buffer(forces, true).set_value(0, args);
     }
-    batch.dispatch_threads(m.reverse, {edges*simd_width}, {threadgroup_size});
+    batch.dispatch_threads(m.reverse[Impl::degree_of(harmonic_count)],
+        {edges*simd_width}, {threadgroup_size});
     m.statistics.staging_seconds += seconds_since(staging);
     const double gpu_seconds = batch.submit_and_wait().gpu_seconds;
     m.statistics.gpu_seconds += gpu_seconds;
