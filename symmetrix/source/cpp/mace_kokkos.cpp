@@ -2631,6 +2631,11 @@ void bind_mace_kokkos(py::module_ &m)
 {
     m.def("_metal_supported", &symmetrix_metal_supported,
         "Return whether this build includes the Apple Metal execution layer.");
+    m.def("_metal_device_ready", [] {
+        std::string reason;
+        const bool ready = symmetrix_metal_device_ready(reason);
+        return py::make_tuple(ready, reason);
+    }, "Return (ready, reason) for the Metal GPU used by metal=True.");
     bind_mace_kokkos<double>(m, "MACEKokkos");
     bind_mace_kokkos<float>(m, "MACEKokkosFloat");
 }

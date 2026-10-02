@@ -92,9 +92,11 @@ def _metal_extension_available():
         native = __import__("symmetrix.symmetrix", fromlist=["MACEKokkosFloat"])
     except ImportError as error:
         return False, f"native extension unavailable: {error}"
-    evaluator = getattr(native, "MACEKokkosFloat", None)
-    if evaluator is None or not hasattr(evaluator, "_load_metal_r1_module"):
+    if not getattr(native, "_metal_supported", lambda: False)():
         return False, "the native extension was built without SYMMETRIX_METAL"
+    ready, reason = native._metal_device_ready()
+    if not ready:
+        return False, reason
     return True, ""
 
 

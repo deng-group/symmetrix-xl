@@ -769,6 +769,11 @@ class Symmetrix(Calculator):
                     "metal=True requires a build with the Metal layer "
                     "(SYMMETRIX_METAL=ON); see docs/user/metal.md"
                 )
+            ready, reason = getattr(
+                symmetrix, "_metal_device_ready", lambda: (True, "")
+            )()
+            if not ready:
+                raise RuntimeError(f"metal=True has no usable Metal GPU: {reason}")
         if self.metal_request and dtype != "float32":
             raise ValueError("metal=True requires dtype='float32'; Metal has no FP64")
         self.dispersion = bool(dispersion)

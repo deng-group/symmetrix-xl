@@ -1,0 +1,83 @@
+name: Metal
+
+# Builds the Apple Metal backend on an Apple-silicon macOS runner and runs its
+# runtime self-test and Python tests. Hosted runners are virtual machines; GPU
+# tests skip with the reported reason when the virtual GPU lacks the Metal 3
+# family or unified memory.
+
+on:
+  pull_request:
+    paths:
+    - 'libsymmetrix/source/metal/**'
+    - 'libsymmetrix/source/metal_view_registry.hpp'
+    - 'libsymmetrix/source/mace_kokkos*'
+    - 'libsymmetrix/source/standard_r0.hpp'
+    - 'libsymmetrix/source/multilayer_perceptron_kokkos.cpp'
+    - 'libsymmetrix/source/host_batched_readout.hpp'
+    - 'libsymmetrix/CMakeLists.txt'
+    - 'symmetrix/source/symmetrix/calculator.py'
+    - 'symmetrix/source/symmetrix/jit_codegen.py'
+    - 'symmetrix/source/symmetrix/metal_codegen.py'
+    - 'symmetrix/source/cpp/mace_kokkos.cpp'
+    - 'symmetrix/test/test_metal_execution.py'
+    - '.github/workflows/metal.yaml'
+  push:
+    branches:
+    - main
+    - metal
+  workflow_dispatch:
+
+jobs:
+  metal:
+    runs-on: macos-15
+    steps:
+    - name: Clone repo
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+    - name: Report the GPU
+      run: system_profiler SPDisplaysDataType
+    - name: Install toolchain
+      run: brew install gcc
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v8.3.2
+      with:
+        python-version: '3.12'
+        enable-cache: true
+    - name: Build and run the Metal runtime self-test
+      run: |
+        uv venv --clear
+        source .venv/bin/activate
+        uv pip install cmake ninja
+        cmake -S libsymmetrix/source/metal -B build-metal-selftest -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build build-metal-selftest --target symmetrix_metal_selftest
+        if python - <<'EOF'
+        import ctypes, sys
+        objc = ctypes.CDLL("/usr/lib/libobjc.dylib")
+        metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+        metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+        sys.exit(0 if metal.MTLCreateSystemDefaultDevice() else 1)
+        EOF
+        then
+          ./build-metal-selftest/symmetrix_metal_selftest
+        else
+          echo "No Metal device on this runner; skipping the runtime self-test."
+        fi
+    - name: Build and install Symmetrix with the Metal layer
+      run: |
+        source .venv/bin/activate
+        uv pip install "./symmetrix[test]" \
+          -C cmake.define.SYMMETRIX_METAL=ON \
+          -C cmake.define.Kokkos_ENABLE_SERIAL=ON \
+          -C cmake.define.Kokkos_ENABLE_OPENMP=OFF \
+          -C cmake.define.CMAKE_Fortran_COMPILER="$(brew --prefix)/bin/gfortran" \
+          -C cmake.define.Python_EXECUTABLE="$(which python)" \
+          -C cmake.define.PYTHON_EXECUTABLE="$(which python)" \
+          -C build-dir=build-metal
+    - name: Run the Metal tests
+      run: |
+        source .venv/bin/activate
+        python -c "import symmetrix.symmetrix as n; print('metal supported:', n._metal_supported(), 'device:', n._metal_device_ready())"
+        cd symmetrix/test
+        pytest -v -rs test_metal_execution.py

@@ -41,6 +41,7 @@
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_m0_module.hpp"
 #include "metal_r0_module.hpp"
+#include "metal_runtime.hpp"
 #include "metal_view_registry.hpp"
 #include "metal_r1_module.hpp"
 #endif
@@ -1603,6 +1604,25 @@ bool symmetrix_metal_supported()
 #ifdef SYMMETRIX_ENABLE_METAL
     return true;
 #else
+    return false;
+#endif
+}
+
+bool symmetrix_metal_device_ready(std::string& reason)
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    const auto& information = symmetrix::execution::metal::metal_information();
+    if (!information.available)
+        reason = "no Metal device: "+information.reason;
+    else if (!information.supports_metal3)
+        reason = information.device_name+" does not support the Metal 3 GPU family";
+    else if (!information.unified_memory)
+        reason = information.device_name+" does not have unified memory";
+    else
+        return true;
+    return false;
+#else
+    reason = "this build does not include the Metal layer";
     return false;
 #endif
 }
