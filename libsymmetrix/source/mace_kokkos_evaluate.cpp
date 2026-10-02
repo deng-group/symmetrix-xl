@@ -59,6 +59,33 @@ void MACEKokkos<Precision>::reduce_node_forces(
     const auto reduced_forces = atom_forces;
     const auto directed_forces = node_forces;
     const int num_edges = static_cast<int>(edge_sources.extent(0));
+    if constexpr (std::is_same_v<
+            typename decltype(factorized_execution_space)::memory_space,
+            Kokkos::HostSpace>) {
+        // A single host worker owns every update, so the scatter needs no
+        // atomics; double compare-and-swap loops dominate this pass otherwise.
+        if (factorized_execution_space.concurrency() == 1) {
+            Kokkos::parallel_for(
+                "MACEKokkos::reduce_node_forces",
+                Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+                    factorized_execution_space, 0, 1),
+                [=] (int) {
+                    const std::size_t edges = static_cast<std::size_t>(num_edges);
+                    for (std::size_t edge=0; edge<edges; ++edge) {
+                        const std::size_t receiver =
+                            static_cast<std::size_t>(edge_receivers(edge));
+                        const std::size_t source =
+                            static_cast<std::size_t>(edge_sources(edge));
+                        for (std::size_t component=0; component<3; ++component) {
+                            const double force = directed_forces(3*edge+component);
+                            reduced_forces(3*source+component) += force;
+                            reduced_forces(3*receiver+component) -= force;
+                        }
+                    }
+                });
+            return;
+        }
+    }
     Kokkos::parallel_for(
         "MACEKokkos::reduce_node_forces",
         Kokkos::RangePolicy<decltype(factorized_execution_space)>(
@@ -206,6 +233,32 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
         const auto unit_direction = execution_prepared_unit_direction;
         const auto radius = execution_prepared_r;
         const double scale = -1.0/volume;
+        if constexpr (std::is_same_v<
+                typename decltype(factorized_execution_space)::memory_space,
+                Kokkos::HostSpace>) {
+            // One host worker: a single edge pass keeps the per-component
+            // summation order of the reductions below while their nine
+            // independent accumulators overlap.
+            if (factorized_execution_space.concurrency() == 1) {
+                Kokkos::parallel_for(
+                    "MACEKokkos::reduce_compact_stress",
+                    Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+                        factorized_execution_space, 0, 1),
+                    [=] (int) {
+                        double value[9] = {};
+                        for (std::size_t edge=0; edge<num_edges; ++edge)
+                            for (int component=0; component<9; ++component)
+                                value[component] += scale
+                                    *directed_forces(3*edge+component/3)
+                                    *radius(edge)
+                                    *static_cast<double>(
+                                        unit_direction(3*edge+component%3));
+                        for (int component=0; component<9; ++component)
+                            reduced_stress(component) = value[component];
+                    });
+                return;
+            }
+        }
         for (int component=0; component<9; ++component) {
             const int force_component = component/3;
             const int vector_component = component%3;
