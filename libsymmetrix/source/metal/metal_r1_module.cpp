@@ -53,8 +53,10 @@ struct MetalR1Module::Impl {
     Pipeline forward;
     Pipeline source;
     Pipeline edge;
-    // Present when the receiver adjoint fits in threadgroup memory.
-    Pipeline edge_tiled;
+    // Present when channels split into 32-wide blocks; one threadgroup per
+    // (receiver, block) writes one partial force plane per block.
+    Pipeline edge_blocked;
+    std::size_t edge_blocks = 0;
     MetalR1Shape shape;
     std::string device_name;
     MetalR1Statistics statistics;
@@ -137,8 +139,11 @@ MetalR1Module::MetalR1Module(
     impl_->forward = impl_->device.pipeline(library, "symmetrix_r1_forward");
     impl_->source = impl_->device.pipeline(library, "symmetrix_r1_source");
     impl_->edge = impl_->device.pipeline(library, "symmetrix_r1_edge");
-    if (library.has_function("symmetrix_r1_edge_tiled"))
-        impl_->edge_tiled = impl_->device.pipeline(library, "symmetrix_r1_edge_tiled");
+    if (library.has_function("symmetrix_r1_edge_blocked")) {
+        impl_->edge_blocked =
+            impl_->device.pipeline(library, "symmetrix_r1_edge_blocked");
+        impl_->edge_blocks = static_cast<std::size_t>(shape.channels)/simd_width;
+    }
     for (const Pipeline* pipeline :
             {&impl_->forward, &impl_->source, &impl_->edge}) {
         if (pipeline->max_total_threads_per_threadgroup() < threadgroup_size)
@@ -307,7 +312,18 @@ void MetalR1Module::reverse(
             static_cast<const float*>(edge.harmonics_gradients),
             3*edges*s.edge_harmonics)
         : m.slot("harmonics_gradients", 16);
-    Buffer& forces = m.zeroed("directed_forces", 3*edges);
+    // Receiver-ordered edges let threadgroups share receiver adjoint rows;
+    // otherwise one 32-lane SIMD group owns each edge.
+    bool receiver_ordered = static_cast<bool>(m.edge_blocked);
+    std::int32_t previous = 0;
+    for (std::size_t e = 0; receiver_ordered && e < edges; ++e) {
+        const std::int32_t receiver = source.edge_receivers[e];
+        receiver_ordered = receiver >= previous
+            && static_cast<std::size_t>(receiver) < extents.receivers;
+        previous = receiver;
+    }
+    const std::size_t force_planes = receiver_ordered ? m.edge_blocks : 1;
+    Buffer& forces = m.zeroed("directed_forces", force_planes*3*edges);
 
     const MetalR1RadialSpline radial = m.spline(source.radial, batch);
     const MetalR1SourceArgs source_packet{
@@ -365,18 +381,6 @@ void MetalR1Module::reverse(
         batch.use_buffer(forces, true);
         m.spline(edge.radial, batch);
     }
-    // Receiver-ordered edges let one threadgroup share its receiver's adjoint
-    // rows; otherwise one 32-lane SIMD group owns each edge.
-    // Receiver-ordered edges let one threadgroup share its receiver's adjoint
-    // rows; otherwise one 32-lane SIMD group owns each edge.
-    bool receiver_ordered = static_cast<bool>(m.edge_tiled);
-    std::int32_t previous = 0;
-    for (std::size_t e = 0; receiver_ordered && e < edges; ++e) {
-        const std::int32_t receiver = source.edge_receivers[e];
-        receiver_ordered = receiver >= previous
-            && static_cast<std::size_t>(receiver) < extents.receivers;
-        previous = receiver;
-    }
     if (receiver_ordered) {
         const std::size_t receiver_count = static_cast<std::size_t>(previous)+1;
         Buffer& offsets = m.slot("receiver_offsets",
@@ -387,9 +391,10 @@ void MetalR1Module::reverse(
             ++offset[source.edge_receivers[e]+1];
         for (std::size_t r = 0; r < receiver_count; ++r)
             offset[r+1] += offset[r];
-        batch.set_value(0, edge_packet).set_buffer(1, offsets)
-            .dispatch_threadgroups(m.edge_tiled, {receiver_count}, {threadgroup_size});
-        ++m.statistics.tiled_edge_launches;
+        batch.set_value(0, edge_packet).set_buffer(1, offsets).set_buffer(2, forces)
+            .dispatch_threadgroups(m.edge_blocked,
+                {receiver_count*m.edge_blocks}, {threadgroup_size});
+        ++m.statistics.blocked_edge_launches;
     } else {
         batch.set_value(0, edge_packet)
             .dispatch_threads(m.edge, {edges*simd_width}, {threadgroup_size});
@@ -406,8 +411,16 @@ void MetalR1Module::reverse(
     // The edge kernel subtracts from zero; the evaluator's directed forces
     // receive the same contribution in double precision.
     const float* force_values = forces.data<float>();
-    for (std::size_t i = 0; i < 3*edges; ++i)
-        edge.directed_forces[i] += static_cast<double>(force_values[i]);
+    if (force_planes == 1)
+        for (std::size_t i = 0; i < 3*edges; ++i)
+            edge.directed_forces[i] += static_cast<double>(force_values[i]);
+    else
+        for (std::size_t i = 0; i < 3*edges; ++i) {
+            double sum = 0.0;
+            for (std::size_t plane = 0; plane < force_planes; ++plane)
+                sum += static_cast<double>(force_values[plane*3*edges+i]);
+            edge.directed_forces[i] += sum;
+        }
     m.statistics.staging_seconds += seconds_since(readback);
     ++m.statistics.reverse_launches;
 }

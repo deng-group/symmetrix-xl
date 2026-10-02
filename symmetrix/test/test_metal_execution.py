@@ -35,7 +35,7 @@ OMAT_CONTRACT = (
 
 
 @pytest.mark.parametrize("contract_path", [FIXTURE_CONTRACT, OMAT_CONTRACT])
-def test_metal_r1_source_is_fp32_msl_with_three_kernels(contract_path):
+def test_metal_r1_source_is_fp32_msl_with_edge_kernels(contract_path):
     contract = json.loads(contract_path.read_text())
     source = render_jit_r1_metal_source(contract)
     metadata = metal_r1_metadata(contract)
@@ -47,6 +47,11 @@ def test_metal_r1_source_is_fp32_msl_with_three_kernels(contract_path):
     assert not re.search(r"\bdouble\b|\bstd::|\bnullptr\b|if constexpr", source)
     assert "simd_sum(local_force_x)" in source
     assert "channel += 32" in source
+    blocked = "kernel void symmetrix_r1_edge_blocked(" in source
+    assert blocked == (metadata["channels"] % 32 == 0)
+    if blocked:
+        assert "const int channel = block_base + int(lane);" in source
+        assert "forces[coordinate_offset] -= local_force_x;" in source
 
 
 def test_metal_m0_source_covers_every_term():
@@ -164,8 +169,9 @@ def test_metal_m0_r0_r1_match_host_fp32_and_run_on_gpu(omat_small_model):
     assert statistics["a1_reverse_launches"] >= 1
     # dPhi1 produced by the A1 reverse is consumed on the GPU by R1.
     assert statistics["resident_uploads_skipped"] >= 1
-    # The evaluator's edge list is receiver-ordered, so the tiled kernel runs.
-    assert statistics["tiled_edge_launches"] >= 1
+    # The evaluator's edge list is receiver-ordered, so the channel-blocked
+    # edge kernel runs.
+    assert statistics["blocked_edge_launches"] >= 1
     assert host.metal_status == "disabled"
     # FP32 summation order differs between the host owners and the GPU.
     assert abs(e_metal - e_host) / len(atoms) < 1e-5

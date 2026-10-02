@@ -1562,8 +1562,8 @@ std::map<std::string, double> MACEKokkos<Precision>::metal_statistics() const
         values["resident_uploads_skipped"] =
             static_cast<double>(statistics.resident_uploads_skipped);
         values["a1_seconds"] = statistics.a1_seconds;
-        values["tiled_edge_launches"] =
-            static_cast<double>(statistics.tiled_edge_launches);
+        values["blocked_edge_launches"] =
+            static_cast<double>(statistics.blocked_edge_launches);
     }
 #endif
     return values;

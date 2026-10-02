@@ -252,45 +252,62 @@ _ADJOINT_READ = re.compile(
     r" \* (\d+) \+ channel\]"
 )
 
-# On-chip budget for one receiver's adjoint rows; Apple GPUs expose 32 KiB of
-# threadgroup memory and the tiled kernel needs no other threadgroup storage.
-METAL_R1_EDGE_TILE_BYTES = 24 * 1024
+# Channel block of the blocked edge kernel: one SIMD lane per channel, so a
+# receiver's adjoint tile is output_components * 32 floats.
+METAL_R1_EDGE_BLOCK_CHANNELS = _SIMD_WIDTH
 
 
-def _tiled_edge_loaders(loaders: str) -> str:
-    """Row loaders that read one receiver's adjoint from threadgroup memory."""
+def _blocked_edge_loaders(loaders: str) -> str:
+    """Row loaders reading one 32-channel block of a receiver's adjoint tile."""
 
     rendered = []
     for row, body in _EDGE_LOADER.findall(loaders):
-        body, reads = _ADJOINT_READ.subn(r"tile[\1 * \2 + channel]", body)
+        body, reads = _ADJOINT_READ.subn(
+            rf"tile[\1 * {METAL_R1_EDGE_BLOCK_CHANNELS} + local]", body
+        )
         if reads == 0 or "args->" in body or "receiver" in body:
             raise ValueError(f"unexpected R1 edge row loader {row}")
         rendered.append(
-            f"inline float tile_row_{row}(\n"
+            f"inline float block_row_{row}(\n"
             "    threadgroup const float* tile,\n"
-            "    int channel)\n{\n" + body + "\n}"
+            "    int local)\n{\n" + body.replace("channel", "local") + "\n}"
         )
     if not rendered:
         raise ValueError("R1 source has no edge row loaders")
     return "\n\n".join(rendered)
 
 
-def _tiled_edge_owner(edge_owner: str) -> str:
-    """Edge owner variant reading adjoint rows through tile_row_* loaders."""
+def _blocked_edge_owner(edge_owner: str, channels: int) -> str:
+    """Edge owner for one 32-channel block; lane l owns channel base + l and
+    the block's partial force is written to its own force plane."""
 
-    owner = edge_owner.replace(
-        "void r1_edge_owner(\n    constant MetalR1EdgeArgs* args,\n    int edge,\n"
-        "    uint lane)",
-        "void r1_edge_owner_tiled(\n    constant MetalR1EdgeArgs* args,\n"
-        "    int edge,\n    uint lane,\n    threadgroup const float* tile)",
+    edits = (
+        (
+            "void r1_edge_owner(\n    constant MetalR1EdgeArgs* args,\n    int edge,\n"
+            "    uint lane)",
+            "void r1_edge_owner_blocked(\n    constant MetalR1EdgeArgs* args,\n"
+            "    int edge,\n    uint lane,\n    int block_base,\n"
+            "    threadgroup const float* tile,\n    device float* forces)",
+        ),
+        (
+            f"    for (int channel = int(lane); channel < {channels}; "
+            f"channel += {_SIMD_WIDTH}) {{",
+            "    {\n        const int channel = block_base + int(lane);",
+        ),
     )
+    owner = edge_owner
+    for old, new in edits:
+        if owner.count(old) != 1:
+            raise ValueError(f"unexpected R1 edge-owner structure near {old[:40]!r}")
+        owner = owner.replace(old, new)
     owner, loads = re.subn(
         r"load_row_(\d+)\(args, receiver, channel\)",
-        r"tile_row_\1(tile, channel)",
+        r"block_row_\1(tile, int(lane))",
         owner,
     )
-    if loads == 0 or "r1_edge_owner_tiled" not in owner:
-        raise ValueError("unexpected R1 edge-owner structure for tiling")
+    owner, writes = re.subn(r"args->directed_forces\[", "forces[", owner)
+    if loads == 0 or writes != 3:
+        raise ValueError("unexpected R1 edge-owner structure for channel blocks")
     return owner
 
 
@@ -423,32 +440,42 @@ kernel void symmetrix_r1_edge(
     r1_edge_owner(&args, int(edge), lane);
 }}
 """
-    if tile_floats * 4 <= METAL_R1_EDGE_TILE_BYTES:
+    block = METAL_R1_EDGE_BLOCK_CHANNELS
+    blocked = channels % block == 0
+    if blocked:
+        block_floats = output_components * block
         kernels += f"""
-// One threadgroup per receiver of a receiver-ordered edge list. The
-// receiver's adjoint rows are staged once in threadgroup memory and shared by
-// the SIMD groups that each own one of its edges.
-kernel void symmetrix_r1_edge_tiled(
+// One threadgroup per (receiver, 32-channel block) of a receiver-ordered edge
+// list, flattened receiver-major. The block's adjoint rows are staged in threadgroup memory, small
+// enough for several threadgroups per core, and each block writes a partial
+// force plane that the host sums in a fixed order.
+kernel void symmetrix_r1_edge_blocked(
     constant MetalR1EdgeArgs& args [[buffer(0)]],
     device const int* receiver_offsets [[buffer(1)]],
-    uint receiver [[threadgroup_position_in_grid]],
+    device float* block_forces [[buffer(2)]],
+    uint position [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint threads [[threads_per_threadgroup]],
     uint group [[simdgroup_index_in_threadgroup]],
     uint groups [[simdgroups_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
 {{
-    threadgroup float tile[{tile_floats}];
+    threadgroup float tile[{block_floats}];
+    const uint receiver = position / {channels // block}u;
+    const uint block_index = position % {channels // block}u;
+    const uint block_base = block_index * {block}u;
     const int begin = receiver_offsets[receiver];
     const int end = receiver_offsets[receiver + 1];
     if (begin == end)
         return;
-    device const float* rows = args.output_adjoint + ulong(receiver) * {tile_floats}u;
-    for (uint index = thread_index; index < {tile_floats}u; index += threads)
-        tile[index] = rows[index];
+    device const float* rows =
+        args.output_adjoint + ulong(receiver) * {tile_floats}u + block_base;
+    for (uint index = thread_index; index < {block_floats}u; index += threads)
+        tile[index] = rows[(index / {block}u) * {channels}u + index % {block}u];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* forces = block_forces + ulong(block_index) * 3u * args.num_edges;
     for (int edge = begin + int(group); edge < end; edge += int(groups))
-        r1_edge_owner_tiled(&args, edge, lane, tile);
+        r1_edge_owner_blocked(&args, edge, lane, int(block_base), tile, forces);
 }}
 """
     return "\n".join(
@@ -463,8 +490,11 @@ kernel void symmetrix_r1_edge_tiled(
             _to_msl(source),
             edge_msl,
             *(
-                (_tiled_edge_loaders(loaders_msl), _tiled_edge_owner(edge_msl))
-                if tile_floats * 4 <= METAL_R1_EDGE_TILE_BYTES
+                (
+                    _blocked_edge_loaders(loaders_msl),
+                    _blocked_edge_owner(edge_msl, channels),
+                )
+                if blocked
                 else ()
             ),
             kernels,
