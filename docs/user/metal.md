@@ -6,7 +6,7 @@ The `metal` branch adds an Apple GPU backend for FP32 MACE evaluation on Apple s
 
 - An Apple silicon Mac (M1 or newer) on macOS 13 or newer. Intel Macs are not supported.
 - Xcode Command Line Tools, which provide the Clang compiler and the Metal runtime compiler. The full Xcode application is not required.
-- Homebrew `gcc`, which provides `gfortran`; the CPU host build enables Fortran.
+- Homebrew `gcc`, which provides `gfortran` for the BLAS detection of the CPU host build. The build finds it without further options.
 - `git` and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
@@ -16,26 +16,25 @@ brew install gcc uv
 
 ## Build and install
 
-The commands below clone the branch with its submodules, create a fresh virtual environment, and build the extension with the Metal layer enabled. The build takes a few minutes and installs `mace-torch`, which is needed only to convert models.
+On Apple silicon the ordinary install builds the Metal layer; no build options are needed. The commands below clone the branch with its submodules, create a fresh virtual environment, and build the extension, which takes a few minutes. The `mace` extra installs `mace-torch`, which is needed only to convert models.
 
 ```bash
 git clone --recursive --branch metal https://github.com/deng-group/symmetrix-xl.git
 cd symmetrix-xl
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-uv pip install "./symmetrix[mace]" \
-  -C cmake.define.SYMMETRIX_METAL=ON \
-  -C cmake.define.Kokkos_ENABLE_SERIAL=ON \
-  -C cmake.define.Kokkos_ENABLE_OPENMP=OFF \
-  -C cmake.define.CMAKE_Fortran_COMPILER="$(brew --prefix)/bin/gfortran" \
-  -C cmake.define.Python_EXECUTABLE="$(which python)" \
-  -C cmake.define.PYTHON_EXECUTABLE="$(which python)" \
-  -C build-dir=build-metal
+uv pip install "./symmetrix[mace]"
 ```
 
-The host side uses the Kokkos Serial backend. An OpenMP host build also works, but the Homebrew OpenMP runtime conflicts with the one bundled in PyTorch when both are imported in the same process, which aborts with `OMP: Error #15`.
+The Mac build uses the Kokkos Serial host backend with Apple's Accelerate BLAS, and Linux builds are unaffected. To rebuild after pulling new commits, rerun the install with `--reinstall-package symmetrix-xl`.
 
-To rebuild after pulling new commits, activate the environment and rerun the same `uv pip install` command with `--reinstall-package symmetrix-xl`.
+## Try it
+
+`benchmarks/metal_md_demo.py` downloads MACE-MP-0b medium on first use, runs the same short MD on the CPU and on the GPU, and prints the throughput of both and their agreement on the starting structure:
+
+```bash
+python benchmarks/metal_md_demo.py
+```
 
 ## Convert a model
 
@@ -76,7 +75,7 @@ The GPU parity tests download the `small-omat-0` foundation model on first use a
 
 ## Expected performance and accuracy
 
-On an M1 Max with MACE-MP-0b medium (2000-atom Na3SbS4, 6.0 A cutoff with a 0.5 A neighbor skin, 110,000 directed edges), 1000 NVT MD steps take 38 s, or 19 us/atom/step. The trajectory stays within 3 meV in total energy of an FP64 reference run over all 1000 steps.
+On an M1 Max with MACE-MP-0b medium (2000-atom Na3SbS4, 6.0 A cutoff with a 0.5 A neighbor skin, so a 6.5 A effective cutoff and 105,256 directed edges in the starting structure), 1000 NVT MD steps take 35 to 37 s, or about 18 us/atom/step. The same run takes 82 us/atom/step with the 8-thread FP32 CPU evaluator. The trajectory stays within 3 meV in total energy of an FP64 reference run over all 1000 steps.
 
 Benchmarks on a laptop are sensitive to other GPU and CPU load. Animated wallpapers, video playback, Spotlight indexing, and security scanners noticeably slow the GPU stages; close them for timing runs.
 
