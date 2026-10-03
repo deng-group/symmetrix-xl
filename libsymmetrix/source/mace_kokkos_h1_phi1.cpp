@@ -69,6 +69,8 @@ void launch_host_h1_gemm(
     const WeightView weight,
     const OutputView output)
 {
+#ifdef SYMMETRIX_ENABLE_METAL
+    // Host fast path, compiled into the Metal build only.
     if (num_nodes == 0)
         return;
     if (execution_space.concurrency() == 1) {
@@ -91,6 +93,7 @@ void launch_host_h1_gemm(
         Kokkos::Profiling::popRegion();
         return;
     }
+#endif
     Kokkos::parallel_for(
         label,
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,

@@ -59,6 +59,8 @@ void MACEKokkos<Precision>::reduce_node_forces(
     const auto reduced_forces = atom_forces;
     const auto directed_forces = node_forces;
     const int num_edges = static_cast<int>(edge_sources.extent(0));
+#ifdef SYMMETRIX_ENABLE_METAL
+    // Host fast path, compiled into the Metal build only.
     if constexpr (std::is_same_v<
             typename decltype(factorized_execution_space)::memory_space,
             Kokkos::HostSpace>) {
@@ -86,6 +88,7 @@ void MACEKokkos<Precision>::reduce_node_forces(
             return;
         }
     }
+#endif
     Kokkos::parallel_for(
         "MACEKokkos::reduce_node_forces",
         Kokkos::RangePolicy<decltype(factorized_execution_space)>(
@@ -233,6 +236,8 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
         const auto unit_direction = execution_prepared_unit_direction;
         const auto radius = execution_prepared_r;
         const double scale = -1.0/volume;
+#ifdef SYMMETRIX_ENABLE_METAL
+        // Host fast path, compiled into the Metal build only.
         if constexpr (std::is_same_v<
                 typename decltype(factorized_execution_space)::memory_space,
                 Kokkos::HostSpace>) {
@@ -259,6 +264,7 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
                 return;
             }
         }
+#endif
         for (int component=0; component<9; ++component) {
             const int force_component = component/3;
             const int vector_component = component%3;

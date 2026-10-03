@@ -473,6 +473,8 @@ void launch_reverse_prepare(
     const int harmonic_count_runtime = output_adjoint.extent_int(1);
     const int value_count = harmonic_count_runtime*channel_count;
     if constexpr (host_execution_space<ExecutionSpace>) {
+#ifdef SYMMETRIX_ENABLE_METAL
+        // Host fast path, compiled into the Metal build only.
         const bool rows_contiguous =
             output_adjoint.stride(2) == 1 && output.stride(2) == 1
             && output_adjoint.stride(1) == static_cast<std::size_t>(channel_count)
@@ -514,6 +516,7 @@ void launch_reverse_prepare(
                 });
             return;
         }
+#endif
         Kokkos::parallel_for(
             "StandardR0::reverse_prepare_host",
             Kokkos::RangePolicy<ExecutionSpace,

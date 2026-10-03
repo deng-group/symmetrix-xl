@@ -435,6 +435,8 @@ void MultilayerPerceptronKokkos::evaluate_gradient_accumulate_recompute(
     const auto weight_offsets = this->weight_offsets;
     const auto weights = this->weights;
     const int hidden_width = shape_host[1];
+#ifdef SYMMETRIX_ENABLE_METAL
+    // Host fast path, compiled into the Metal build only.
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
@@ -479,6 +481,7 @@ void MultilayerPerceptronKokkos::evaluate_gradient_accumulate_recompute(
             return;
         }
     }
+#endif
     using TeamPolicy = Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>;
     using Member = TeamPolicy::member_type;
     using ScratchSpace = Member::scratch_memory_space;

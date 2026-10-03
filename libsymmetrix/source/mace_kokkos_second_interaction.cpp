@@ -603,6 +603,8 @@ void MACEKokkos<Precision>::compute_A1_scaled(
     const int active_type_count = num_active_types;
     const auto num_channels = this->num_channels;
     const auto num_lm = this->num_lm;
+#ifdef SYMMETRIX_ENABLE_METAL
+    // Host fast path, compiled into the Metal build only.
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
@@ -658,6 +660,7 @@ void MACEKokkos<Precision>::compute_A1_scaled(
             return;
         }
     }
+#endif
     Kokkos::parallel_for(
         "MACEKokkos::compute_A1_scaled",
         Kokkos::TeamPolicy<>(
@@ -740,6 +743,8 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
     const bool compact_geometry = use_compact_edge_geometry();
     const auto unit_direction = execution_prepared_unit_direction;
     auto node_forces = this->node_forces;
+#ifdef SYMMETRIX_ENABLE_METAL
+    // Host fast path, compiled into the Metal build only.
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
@@ -827,6 +832,7 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
             return;
         }
     }
+#endif
     Kokkos::parallel_for(
         "MACEKokkos::reverse_A1_scaled",
         Kokkos::TeamPolicy<>(
@@ -1303,6 +1309,8 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
+#ifdef SYMMETRIX_ENABLE_METAL
+        // Host fast path, compiled into the Metal build only.
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()
                 && num_channels <= host_h2_blas_max_channels
@@ -1319,6 +1327,7 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
             complete_device_stage("MACEKokkos::compute_H2");
             return;
         }
+#endif
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()
                 && num_channels <= host_h2_blas_max_channels) {
@@ -1428,6 +1437,8 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
+#ifdef SYMMETRIX_ENABLE_METAL
+        // Host fast path, compiled into the Metal build only.
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()
                 && num_channels <= host_h2_blas_max_channels
@@ -1445,6 +1456,7 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
             complete_device_stage("MACEKokkos::reverse_H2");
             return;
         }
+#endif
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()
                 && num_channels <= host_h2_blas_max_channels) {
