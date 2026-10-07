@@ -12,6 +12,7 @@ getting_started
 installation
 models
 execution
+batching
 backends
 metal
 lammps

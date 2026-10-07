@@ -14,6 +14,7 @@ __version__ = "0.1.1"
 
 _FRONTEND_EXPORTS = {
     "Symmetrix": (".calculator", "Symmetrix"),
+    "BatchEvaluator": (".batch", "BatchEvaluator"),
     "FieldAwareCalculator": (".calculator", "FieldAwareCalculator"),
     "FieldContributionCalculator": (".calculator", "FieldContributionCalculator"),
     "SymmetrixEnsemble": (".ensemble", "SymmetrixEnsemble"),
@@ -106,6 +107,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "BackendError",
+    "BatchEvaluator",
     "FieldAwareCalculator",
     "FieldContributionCalculator",
     "Symmetrix",

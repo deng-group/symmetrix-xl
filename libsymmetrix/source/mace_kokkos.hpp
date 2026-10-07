@@ -696,6 +696,12 @@ void reduce_node_forces(
 void reduce_prepared_node_forces(std::uint64_t graph_generation);
 void reduce_prepared_all_interactions_node_forces(std::uint64_t graph_generation);
 void reduce_stress(double volume, Kokkos::View<const double*> xyz);
+// Per-system stress of a graph whose edges are grouped into contiguous
+// segments, one per disconnected system; stress_tensor holds 9 values per system.
+void reduce_segmented_stress(
+    std::span<const double> volumes,
+    std::span<const std::int64_t> edge_offsets,
+    Kokkos::View<const double*> xyz);
 void reduce_prepared_stress(double volume, std::uint64_t graph_generation);
 void reduce_prepared_all_interactions_stress(
     double volume,

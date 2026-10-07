@@ -3957,6 +3957,22 @@ class Symmetrix(Calculator):
             )
         self._add_dispersion_results(evaluation_properties)
 
+    def calculate_batch(
+        self, structures, properties=("energy", "forces"), batch_mode="native"
+    ):
+        """Evaluate independent structures and return one result dict each.
+
+        ``batch_mode="native"`` evaluates all structures as one disconnected
+        graph in a single native call; ``batch_mode="sequential"`` evaluates
+        them in turn. See :class:`symmetrix.batch.BatchEvaluator`.
+        """
+        evaluators = self.__dict__.setdefault("_batch_evaluators", {})
+        if batch_mode not in evaluators:
+            from .batch import BatchEvaluator
+
+            evaluators[batch_mode] = BatchEvaluator(self, batch_mode=batch_mode)
+        return evaluators[batch_mode].calculate(structures, properties)
+
 
 class FieldContributionCalculator(Calculator):
     """Return the exact finite-field contribution of a MACEField calculator.

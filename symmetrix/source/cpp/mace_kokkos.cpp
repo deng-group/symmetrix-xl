@@ -19,6 +19,8 @@ using ContiguousIntArray =
     py::array_t<int, py::array::c_style | py::array::forcecast>;
 using ContiguousDoubleArray =
     py::array_t<double, py::array::c_style | py::array::forcecast>;
+using ContiguousInt64Array =
+    py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>;
 
 template <typename T>
 py::array_t<T> shaped_array(
@@ -2077,6 +2079,23 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             },
             py::arg("volume"), py::arg("xyz"),
             py::arg("execution_graph_generation") = 0)
+        .def("_reduce_segmented_stress",
+            [] (MACEKokkos<Precision>& self,
+                    ContiguousDoubleArray volumes,
+                    ContiguousInt64Array edge_offsets,
+                    ContiguousDoubleArray xyz) {
+                self.reduce_segmented_stress(
+                    std::span<const double>(volumes.data(), volumes.size()),
+                    std::span<const std::int64_t>(
+                        edge_offsets.data(), edge_offsets.size()),
+                    create_kokkos_view("segmented stress xyz", xyz));
+                const auto num_systems =
+                    static_cast<py::ssize_t>(volumes.size());
+                return shaped_array(
+                    view_prefix_1d(self.stress_tensor, 9*volumes.size()),
+                    {num_systems, 3, 3});
+            },
+            py::arg("volumes"), py::arg("edge_offsets"), py::arg("xyz"))
         .def_readonly("has_field_coupling", &MACEKokkos<Precision>::has_field_coupling)
         .def_property_readonly("electric_field_adj",
             [] (MACEKokkos<Precision>& self) {

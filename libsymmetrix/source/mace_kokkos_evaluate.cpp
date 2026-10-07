@@ -186,6 +186,76 @@ void MACEKokkos<Precision>::reduce_stress(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::reduce_segmented_stress(
+    const std::span<const double> volumes,
+    const std::span<const std::int64_t> edge_offsets,
+    Kokkos::View<const double*> xyz)
+{
+    const std::size_t num_systems = volumes.size();
+    if (num_systems == 0 || edge_offsets.size() != num_systems + 1
+        || xyz.extent(0)%3 != 0 || edge_offsets.front() != 0
+        || edge_offsets.back() != static_cast<std::int64_t>(xyz.extent(0)/3))
+        throw std::invalid_argument(
+            "Segmented stress inputs are inconsistent.");
+    for (std::size_t system=0; system<num_systems; ++system)
+        if (!std::isfinite(volumes[system]) || !(volumes[system] > 0.0)
+            || edge_offsets[system] > edge_offsets[system + 1])
+            throw std::invalid_argument(
+                "Segmented stress volumes or edge offsets are invalid.");
+    const std::size_t num_edges = xyz.extent(0)/3;
+    if (node_forces.extent(0) < 3*num_edges)
+        throw std::invalid_argument(
+            "Stress reduction exceeds the evaluated edge extent.");
+    if (stress_tensor.extent(0) != 9*num_systems)
+        Kokkos::realloc(stress_tensor, 9*num_systems);
+
+    auto scales = Kokkos::View<double*>(
+        Kokkos::view_alloc("segmented stress scales", Kokkos::WithoutInitializing),
+        num_systems);
+    auto offsets = Kokkos::View<std::int64_t*>(
+        Kokkos::view_alloc("segmented stress offsets", Kokkos::WithoutInitializing),
+        num_systems + 1);
+    auto host_scales = Kokkos::create_mirror_view(scales);
+    for (std::size_t system=0; system<num_systems; ++system)
+        host_scales(system) = -1.0/volumes[system];
+    Kokkos::deep_copy(factorized_execution_space, scales, host_scales);
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        offsets,
+        Kokkos::View<const std::int64_t*, Kokkos::HostSpace,
+            Kokkos::MemoryUnmanaged>(edge_offsets.data(), edge_offsets.size()));
+
+    const auto reduced_stress = stress_tensor;
+    const auto directed_forces = node_forces;
+    using team_policy = Kokkos::TeamPolicy<decltype(factorized_execution_space)>;
+    Kokkos::parallel_for(
+        "MACEKokkos::reduce_segmented_stress",
+        team_policy(
+            factorized_execution_space,
+            static_cast<int>(9*num_systems),
+            Kokkos::AUTO),
+        KOKKOS_LAMBDA (const typename team_policy::member_type& team) {
+            const std::size_t owner = team.league_rank();
+            const std::size_t system = owner/9;
+            const int force_component = owner%9/3;
+            const int vector_component = owner%3;
+            double value = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::TeamThreadRange(
+                    team, offsets(system), offsets(system + 1)),
+                [&] (const std::int64_t edge, double& update) {
+                    const std::size_t index = static_cast<std::size_t>(edge);
+                    update += directed_forces(3*index+force_component)
+                        *xyz(3*index+vector_component);
+                },
+                value);
+            Kokkos::single(Kokkos::PerTeam(team), [&] () {
+                reduced_stress(owner) = scales(system)*value;
+            });
+        });
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::reduce_prepared_stress(
     const double volume,
     const std::uint64_t graph_generation)
