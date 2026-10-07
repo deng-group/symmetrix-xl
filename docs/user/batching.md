@@ -14,6 +14,21 @@ energies = [result["energy"] for result in results]
 
 `symmetrix.BatchEvaluator(calc, batch_mode="native", neighbor_cache_size=64)` exposes the same evaluation with an explicit neighbor-list cache. Neighbor lists are keyed by positions, cell, and periodicity, so structures that differ only in species, such as the orderings of a disordered lattice before relaxation, share one neighbor list. Stress requires three-dimensional cells; omit it for molecules without a cell.
 
+## Relaxation
+
+`Symmetrix.relax_batch` relaxes structures in place with one batched evaluation per optimizer step. Each step evaluates every unconverged structure together and then advances one ASE optimizer per structure. Converged structures leave the batch, and the remaining ones continue until they converge or reach `steps`.
+
+```python
+from ase.filters import FrechetCellFilter
+from ase.optimize import FIRE
+
+states = calc.relax_batch(structures, fmax=0.05, steps=500, optimizer=FIRE)
+states = calc.relax_batch(structures, fmax=0.05, cell_filter=FrechetCellFilter)
+converged = [state["converged"] for state in states]
+```
+
+Each returned dictionary holds `converged`, `steps`, and the final `energy`, `forces`, and, with a cell filter, `stress`. The optimizer must read forces once per step at the current positions, as `FIRE`, `BFGS`, and `LBFGS` do. Line-search optimizers such as `BFGSLineSearch` evaluate trial positions inside a step and are rejected. In native batches each structure keeps a neighbor list built at the model cutoff plus `neighbor_skin` (0.5 A by default) and rebuilds it when an atom moves by more than half the skin or the cell changes. In FP64 each structure follows the trajectory of an independent ASE relaxation with the same optimizer to rounding. FP32 trajectories can drift slightly and reach the same minimum within FP32 tolerance.
+
 ## Performance
 
 A native batch pays the fixed cost of an evaluation (kernel submissions, synchronization, and host bookkeeping) once per batch instead of once per structure. It therefore helps most when a single small structure leaves a GPU underused. On one CPU core the cost already scales with the edge count, and batching saves only the per-call overhead.

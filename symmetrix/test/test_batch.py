@@ -38,7 +38,11 @@ def omat_small_model():
 
 @pytest.fixture(scope="module")
 def fp64_calculator(omat_small_model):
-    return Symmetrix(omat_small_model, species=SPECIES, dtype="float64")
+    calculator = Symmetrix(omat_small_model, species=SPECIES, dtype="float64")
+    yield calculator
+    # pytest keeps the last test's fixture arguments until the session
+    # teardown finalizes Kokkos, so release the native state with the module.
+    calculator.__dict__.clear()
 
 
 def _perovskite(repeat=(2, 2, 2), a=3.95):
@@ -315,3 +319,133 @@ def test_native_metal_batch_matches_host_fp32(omat_small_model):
     assert metal.metal_statistics()["forward_launches"] >= 1
     # FP32 summation order differs between the host owners and the GPU.
     _assert_matches_ase(results, structures, host, 1e-5 * 80, 1e-4, 1e-5)
+
+
+def _rattled_orderings(count):
+    structures = _orderings(count, seed=5)
+    for index, atoms in enumerate(structures):
+        atoms.rattle(0.08, seed=10 + index)
+    return structures
+
+
+def _relax_independently(atoms, calculator, optimizer, cell_filter=None):
+    atoms = atoms.copy()
+    atoms.calc = calculator
+    target = cell_filter(atoms) if cell_filter else atoms
+    dynamics = optimizer(target, logfile=None)
+    converged = dynamics.run(fmax=0.05, steps=60)
+    return atoms, converged, dynamics.nsteps
+
+
+@pytest.mark.parametrize("optimizer_name", ["FIRE", "BFGS"])
+def test_batched_relaxation_follows_independent_relaxations(
+    fp64_calculator, optimizer_name
+):
+    import ase.optimize
+
+    optimizer = getattr(ase.optimize, optimizer_name)
+    structures = _rattled_orderings(3)
+    references = [
+        _relax_independently(atoms, fp64_calculator, optimizer) for atoms in structures
+    ]
+
+    states = fp64_calculator.relax_batch(
+        structures, fmax=0.05, steps=60, optimizer=optimizer
+    )
+
+    for atoms, state, (reference, converged, nsteps) in zip(
+        structures, states, references
+    ):
+        assert atoms.calc is None
+        assert state["converged"] == converged
+        assert state["steps"] == nsteps
+        np.testing.assert_allclose(atoms.positions, reference.positions, atol=1e-8)
+        np.testing.assert_allclose(
+            state["energy"], reference.get_potential_energy(), atol=1e-8
+        )
+        if state["converged"]:
+            assert np.max(np.linalg.norm(state["forces"], axis=1)) < 0.05
+
+
+def test_batched_cell_relaxation_follows_independent_relaxations(fp64_calculator):
+    from ase.filters import FrechetCellFilter
+    from ase.optimize import FIRE
+
+    structures = _rattled_orderings(2)
+    structures[1].set_cell(structures[1].cell * 1.02, scale_atoms=True)
+    references = [
+        _relax_independently(atoms, fp64_calculator, FIRE, FrechetCellFilter)
+        for atoms in structures
+    ]
+
+    states = fp64_calculator.relax_batch(
+        structures, fmax=0.05, steps=60, cell_filter=FrechetCellFilter
+    )
+
+    for atoms, state, (reference, converged, nsteps) in zip(
+        structures, states, references
+    ):
+        assert state["converged"] == converged
+        assert state["steps"] == nsteps
+        assert state["stress"].shape == (6,)
+        np.testing.assert_allclose(atoms.cell.array, reference.cell.array, atol=1e-8)
+        np.testing.assert_allclose(atoms.positions, reference.positions, atol=1e-8)
+
+
+def test_batched_relaxation_rejects_line_search_optimizers(fp64_calculator):
+    from ase.optimize import BFGSLineSearch
+
+    with pytest.raises(RuntimeError, match="inside step"):
+        fp64_calculator.relax_batch(
+            _rattled_orderings(1), steps=5, optimizer=BFGSLineSearch
+        )
+
+
+def test_native_metal_batched_relaxation_converges(omat_small_model):
+    available, reason = _metal_available()
+    if not available:
+        pytest.skip(reason)
+    from ase.optimize import BFGS
+
+    host = Symmetrix(omat_small_model, species=SPECIES, dtype="float32")
+    metal = Symmetrix(omat_small_model, species=SPECIES, dtype="float32", metal=True)
+    structures = _rattled_orderings(3)
+    references = [_relax_independently(atoms, host, BFGS) for atoms in structures]
+
+    states = metal.relax_batch(structures, fmax=0.05, steps=60, optimizer=BFGS)
+
+    for atoms, state, (reference, converged, _) in zip(structures, states, references):
+        assert converged and state["converged"]
+        assert np.max(np.linalg.norm(state["forces"], axis=1)) < 0.05
+        # FP32 trajectories on the GPU and host diverge slightly but reach the
+        # same local minimum.
+        np.testing.assert_allclose(
+            state["energy"], reference.get_potential_energy(), atol=2e-3
+        )
+
+
+def test_batched_relaxation_reuses_skinned_neighbor_lists(fp64_calculator, monkeypatch):
+    structures = _rattled_orderings(2)
+    rebuilt = [atoms.copy() for atoms in structures]
+    evaluator = BatchEvaluator(fp64_calculator)
+    builds = []
+    original = evaluator._neighbors
+
+    def counting(atoms, cutoff=None, cache=True):
+        builds.append(cutoff)
+        return original(atoms, cutoff, cache)
+
+    monkeypatch.setattr(evaluator, "_neighbors", counting)
+
+    states = evaluator.relax(structures, fmax=0.05, steps=60)
+    skinned_builds = len(builds)
+    reference = BatchEvaluator(fp64_calculator).relax(
+        rebuilt, fmax=0.05, steps=60, neighbor_skin=0.0
+    )
+
+    steps = sum(state["steps"] for state in states)
+    assert all(cutoff == fp64_calculator.cutoff + 0.5 for cutoff in builds)
+    assert skinned_builds < steps / 4
+    for atoms, state, other, expected in zip(structures, states, rebuilt, reference):
+        assert state["steps"] == expected["steps"]
+        np.testing.assert_allclose(atoms.positions, other.positions, atol=1e-8)

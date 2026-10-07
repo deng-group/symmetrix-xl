@@ -4,7 +4,8 @@ import hashlib
 from collections import OrderedDict
 
 import numpy as np
-from ase.calculators.calculator import all_changes
+from ase.calculators.calculator import Calculator, all_changes
+from ase.optimize import FIRE
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from .calculator import _receiver_major_neighbor_arrays, neighbor_list
@@ -57,6 +58,9 @@ class BatchEvaluator:
         Stress is returned in ASE's six-component Voigt order and sign
         convention and requires three-dimensional cells.
         """
+        return self._calculate(structures, properties)
+
+    def _calculate(self, structures, properties, graphs=None):
         structures = list(structures)
         properties = tuple(dict.fromkeys(properties))
         unsupported = [prop for prop in properties if prop not in BATCH_PROPERTIES]
@@ -74,7 +78,7 @@ class BatchEvaluator:
                 )
         if self.batch_mode == "native":
             totals, energies, forces, virials = self._calculate_native(
-                structures, compute_stress
+                structures, compute_stress, graphs
             )
         else:
             totals, energies, forces, virials = self._calculate_sequential(
@@ -96,6 +100,81 @@ class BatchEvaluator:
             results.append(result)
         return results
 
+    def relax(
+        self,
+        structures,
+        fmax=0.05,
+        steps=500,
+        optimizer=FIRE,
+        cell_filter=None,
+        optimizer_kwargs=None,
+        filter_kwargs=None,
+        neighbor_skin=0.5,
+    ):
+        """Relax structures in place, evaluating all unconverged ones together.
+
+        Each iteration evaluates every unconverged structure in one batch and
+        then advances one ASE optimizer per structure by one step. The
+        optimizer must read forces once per step at the current positions, as
+        ``FIRE``, ``BFGS``, and ``LBFGS`` do; line-search optimizers that
+        evaluate trial positions inside ``step`` are rejected. ``cell_filter``,
+        for example ``ase.filters.FrechetCellFilter``, also relaxes the cell
+        and adds stress to each evaluation. In native batches, each structure
+        keeps a neighbor list built at the model cutoff plus ``neighbor_skin``
+        until an atom moves by more than half the skin or the cell changes.
+
+        Returns one dictionary per structure with ``converged``, ``steps``,
+        and the final ``energy``, ``forces``, and, with a cell filter,
+        ``stress``. Converged structures leave the batch.
+        """
+        structures = list(structures)
+        optimizer_kwargs = {"logfile": None, **(optimizer_kwargs or {})}
+        filter_kwargs = filter_kwargs or {}
+        properties = (
+            ("energy", "forces", "stress")
+            if cell_filter
+            else (
+                "energy",
+                "forces",
+            )
+        )
+        holders = [_BatchResults() for _ in structures]
+        optimizers = []
+        for atoms, holder in zip(structures, holders):
+            atoms.calc = holder
+            target = cell_filter(atoms, **filter_kwargs) if cell_filter else atoms
+            optimizers.append(optimizer(target, **optimizer_kwargs))
+        for dynamics in optimizers:
+            dynamics.fmax = fmax
+        states = [{"converged": False, "steps": 0} for _ in structures]
+        active = list(range(len(structures)))
+        skins = [_SkinNeighbors(self, neighbor_skin) for _ in structures]
+        while active:
+            batch = [structures[i] for i in active]
+            graphs = None
+            if self.batch_mode == "native":
+                graphs = [skins[i].graph(structures[i]) for i in active]
+            results = self._calculate(batch, properties, graphs)
+            remaining = []
+            for index, result in zip(active, results):
+                holders[index].store(structures[index], result)
+                dynamics = optimizers[index]
+                gradient = dynamics.optimizable.get_gradient()
+                if dynamics.gradient_converged(gradient):
+                    states[index]["converged"] = True
+                    continue
+                if states[index]["steps"] >= steps:
+                    continue
+                dynamics.step()
+                dynamics.nsteps += 1
+                states[index]["steps"] += 1
+                remaining.append(index)
+            active = remaining
+        for index, atoms in enumerate(structures):
+            states[index].update(holders[index].results)
+            atoms.calc = None
+        return states
+
     def _calculate_sequential(self, structures, compute_stress):
         properties = ["energy", "forces"]
         if compute_stress:
@@ -112,13 +191,14 @@ class BatchEvaluator:
                 virials.append(stress * abs(atoms.cell.volume))
         return totals, energies, forces, virials
 
-    def _calculate_native(self, structures, compute_stress):
+    def _calculate_native(self, structures, compute_stress, graphs=None):
         calculator = self.calculator
         evaluator = calculator.evaluator
         atom_counts = np.array([len(atoms) for atoms in structures], dtype=np.int64)
         atom_offsets = np.concatenate(([0], np.cumsum(atom_counts)))
         num_nodes = int(atom_offsets[-1])
-        graphs = [self._neighbors(atoms) for atoms in structures]
+        if graphs is None:
+            graphs = [self._neighbors(atoms) for atoms in structures]
         edge_offsets = np.concatenate(
             ([0], np.cumsum([len(graph[0]) for graph in graphs]))
         ).astype(np.int64)
@@ -186,17 +266,20 @@ class BatchEvaluator:
         forces = np.split(forces, atom_offsets[1:-1])
         return totals, energies, forces, virials
 
-    def _neighbors(self, atoms):
+    def _neighbors(self, atoms, cutoff=None, cache=True):
         """Return receiver-major ``(i, j, r, xyz)`` edges of one structure."""
-        digest = hashlib.blake2b(digest_size=16)
-        for array in (atoms.positions, atoms.cell.array, atoms.pbc):
-            digest.update(np.ascontiguousarray(array).tobytes())
-        key = digest.digest()
-        cached = self._neighbor_cache.get(key)
-        if cached is not None:
-            self._neighbor_cache.move_to_end(key)
-            return cached
-        cutoff = self.calculator.cutoff
+        cache = cache and cutoff is None and self.neighbor_cache_size > 0
+        if cache:
+            digest = hashlib.blake2b(digest_size=16)
+            for array in (atoms.positions, atoms.cell.array, atoms.pbc):
+                digest.update(np.ascontiguousarray(array).tobytes())
+            key = digest.digest()
+            cached = self._neighbor_cache.get(key)
+            if cached is not None:
+                self._neighbor_cache.move_to_end(key)
+                return cached
+        if cutoff is None:
+            cutoff = self.calculator.cutoff
         if not np.any(atoms.pbc) and atoms.cell.volume == 0.0:
             # A non-periodic cell only bounds the neighbor search.
             atoms = atoms.copy()
@@ -211,7 +294,7 @@ class BatchEvaluator:
         )
         r = np.linalg.norm(xyz, axis=1)
         cached = (receivers, sources, r, xyz)
-        if self.neighbor_cache_size > 0:
+        if cache:
             self._neighbor_cache[key] = cached
             while len(self._neighbor_cache) > self.neighbor_cache_size:
                 self._neighbor_cache.popitem(last=False)
@@ -230,6 +313,78 @@ class BatchEvaluator:
                 f"Supported atomic numbers are {supported}."
             )
         return types
+
+
+class _SkinNeighbors:
+    """Neighbor list of one relaxing structure, reused within a skin."""
+
+    def __init__(self, evaluator, skin):
+        self.evaluator = evaluator
+        self.skin = float(skin)
+        self.reference = None
+
+    def graph(self, atoms):
+        cutoff = self.evaluator.calculator.cutoff
+        positions = np.asarray(atoms.positions, dtype=np.float64)
+        if self.skin <= 0.0:
+            return self.evaluator._neighbors(atoms)
+        if (
+            self.reference is None
+            or not np.array_equal(self.reference[1], atoms.cell.array)
+            or not np.array_equal(self.reference[2], atoms.pbc)
+            or np.max(np.linalg.norm(positions - self.reference[0], axis=1))
+            > 0.5 * self.skin
+        ):
+            receivers, sources, _, xyz = self.evaluator._neighbors(
+                atoms, cutoff + self.skin, cache=False
+            )
+            self.reference = (
+                positions.copy(),
+                atoms.cell.array.copy(),
+                atoms.pbc.copy(),
+                receivers,
+                sources,
+                xyz,
+            )
+        reference_positions, _, _, receivers, sources, reference_xyz = self.reference
+        displacement = positions - reference_positions
+        xyz = reference_xyz + displacement[sources] - displacement[receivers]
+        r = np.linalg.norm(xyz, axis=1)
+        active = r < cutoff
+        return (
+            receivers[active],
+            sources[active],
+            np.ascontiguousarray(r[active]),
+            np.ascontiguousarray(xyz[active]),
+        )
+
+
+class _BatchResults(Calculator):
+    """Results of one structure from the latest batch evaluation."""
+
+    implemented_properties = list(BATCH_PROPERTIES)
+
+    def store(self, atoms, results):
+        self.atoms = atoms.copy()
+        self.results = dict(results)
+
+    def check_state(self, atoms, tol=1e-15):
+        if (
+            self.atoms is not None
+            and np.array_equal(self.atoms.positions, atoms.positions)
+            and np.array_equal(self.atoms.cell.array, atoms.cell.array)
+            and np.array_equal(self.atoms.numbers, atoms.numbers)
+            and np.array_equal(self.atoms.pbc, atoms.pbc)
+        ):
+            return []
+        return list(all_changes)
+
+    def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+        raise RuntimeError(
+            "Batched relaxation evaluates structures only between optimizer "
+            "steps; the optimizer requested an evaluation inside step(). Use "
+            "an optimizer such as FIRE, BFGS, or LBFGS."
+        )
 
 
 def _native_unsupported_reason(calculator):

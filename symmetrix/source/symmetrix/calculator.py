@@ -3973,6 +3973,23 @@ class Symmetrix(Calculator):
             evaluators[batch_mode] = BatchEvaluator(self, batch_mode=batch_mode)
         return evaluators[batch_mode].calculate(structures, properties)
 
+    def relax_batch(
+        self, structures, fmax=0.05, steps=500, batch_mode="native", **kwargs
+    ):
+        """Relax structures in place with one batched evaluation per step.
+
+        Keyword arguments are passed to
+        :meth:`symmetrix.batch.BatchEvaluator.relax`.
+        """
+        evaluators = self.__dict__.setdefault("_batch_evaluators", {})
+        if batch_mode not in evaluators:
+            from .batch import BatchEvaluator
+
+            evaluators[batch_mode] = BatchEvaluator(self, batch_mode=batch_mode)
+        return evaluators[batch_mode].relax(
+            structures, fmax=fmax, steps=steps, **kwargs
+        )
+
 
 class FieldContributionCalculator(Calculator):
     """Return the exact finite-field contribution of a MACEField calculator.
