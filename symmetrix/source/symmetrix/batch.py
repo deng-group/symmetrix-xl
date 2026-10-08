@@ -128,36 +128,122 @@ class BatchEvaluator:
         ``stress``. Converged structures leave the batch.
         """
         structures = list(structures)
-        optimizer_kwargs = {"logfile": None, **(optimizer_kwargs or {})}
         filter_kwargs = filter_kwargs or {}
-        properties = (
-            ("energy", "forces", "stress")
-            if cell_filter
-            else (
-                "energy",
-                "forces",
-            )
+        properties = ("energy", "forces")
+        if cell_filter:
+            properties += ("stress",)
+        for atoms in structures:
+            atoms.calc = _BatchResults()
+        targets = [
+            cell_filter(atoms, **filter_kwargs) if cell_filter else atoms
+            for atoms in structures
+        ]
+        states = self._optimize_in_lockstep(
+            targets,
+            [[atoms] for atoms in structures],
+            properties,
+            fmax,
+            steps,
+            optimizer,
+            optimizer_kwargs,
+            neighbor_skin,
         )
-        holders = [_BatchResults() for _ in structures]
-        optimizers = []
-        for atoms, holder in zip(structures, holders):
-            atoms.calc = holder
-            target = cell_filter(atoms, **filter_kwargs) if cell_filter else atoms
-            optimizers.append(optimizer(target, **optimizer_kwargs))
+        for state, atoms in zip(states, structures):
+            state.update(atoms.calc.results)
+            atoms.calc = None
+        return states
+
+    def neb(
+        self,
+        nebs,
+        fmax=0.05,
+        steps=500,
+        optimizer=FIRE,
+        optimizer_kwargs=None,
+        neighbor_skin=0.5,
+    ):
+        """Optimize ASE NEB bands, evaluating all their images together.
+
+        ``nebs`` are ``ase.mep.NEB`` objects built on interpolated images.
+        Each iteration evaluates every image that moved, across all bands, in
+        one batch and then advances one optimizer per band by one step; the
+        fixed endpoints are evaluated once. Every image receives its own
+        read-only result calculator, which stays attached afterwards so that
+        tools such as ``ase.mep.NEBTools`` can read the final energies and
+        forces. Options that evaluate images inside an optimizer step, such as
+        ``remove_rotation_and_translation`` or dynamic relaxation, are
+        rejected.
+
+        Returns one dictionary per band with ``converged``, ``steps``, and the
+        image ``energies``.
+        """
+        nebs = list(nebs)
+        for band in nebs:
+            for image in band.images:
+                image.calc = _BatchResults()
+        states = self._optimize_in_lockstep(
+            nebs,
+            [list(band.images) for band in nebs],
+            ("energy", "forces"),
+            fmax,
+            steps,
+            optimizer,
+            optimizer_kwargs,
+            neighbor_skin,
+        )
+        for state, band in zip(states, nebs):
+            state["energies"] = np.array(
+                [image.calc.results["energy"] for image in band.images]
+            )
+        return states
+
+    def _optimize_in_lockstep(
+        self,
+        targets,
+        groups,
+        properties,
+        fmax,
+        steps,
+        optimizer,
+        optimizer_kwargs,
+        neighbor_skin,
+    ):
+        """Advance one optimizer per target, batching every stale structure.
+
+        ``groups[k]`` lists the structures whose results optimizer ``k``
+        reads; each carries a ``_BatchResults`` calculator. Every iteration
+        evaluates, in one batch, each structure of an active group whose
+        results do not match its current state, then steps each active
+        optimizer once.
+        """
+        optimizer_kwargs = {"logfile": None, **(optimizer_kwargs or {})}
+        optimizers = [optimizer(target, **optimizer_kwargs) for target in targets]
         for dynamics in optimizers:
             dynamics.fmax = fmax
-        states = [{"converged": False, "steps": 0} for _ in structures]
-        active = list(range(len(structures)))
-        skins = [_SkinNeighbors(self, neighbor_skin) for _ in structures]
+        skins = {}
+        states = [{"converged": False, "steps": 0} for _ in targets]
+        active = list(range(len(targets)))
         while active:
-            batch = [structures[i] for i in active]
-            graphs = None
-            if self.batch_mode == "native":
-                graphs = [skins[i].graph(structures[i]) for i in active]
-            results = self._calculate(batch, properties, graphs)
+            stale = [
+                atoms
+                for index in active
+                for atoms in groups[index]
+                if atoms.calc.check_state(atoms)
+            ]
+            if stale:
+                graphs = None
+                if self.batch_mode == "native":
+                    graphs = [
+                        skins.setdefault(
+                            id(atoms), _SkinNeighbors(self, neighbor_skin)
+                        ).graph(atoms)
+                        for atoms in stale
+                    ]
+                results = self._calculate(stale, properties, graphs)
+                for atoms, result in zip(stale, results):
+                    atoms.calc.store(atoms, result)
             remaining = []
-            for index, result in zip(active, results):
-                holders[index].store(structures[index], result)
+            for index in active:
                 dynamics = optimizers[index]
                 gradient = dynamics.optimizable.get_gradient()
                 if dynamics.gradient_converged(gradient):
@@ -170,9 +256,6 @@ class BatchEvaluator:
                 states[index]["steps"] += 1
                 remaining.append(index)
             active = remaining
-        for index, atoms in enumerate(structures):
-            states[index].update(holders[index].results)
-            atoms.calc = None
         return states
 
     def _calculate_sequential(self, structures, compute_stress):
@@ -381,9 +464,10 @@ class _BatchResults(Calculator):
 
     def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
         raise RuntimeError(
-            "Batched relaxation evaluates structures only between optimizer "
-            "steps; the optimizer requested an evaluation inside step(). Use "
-            "an optimizer such as FIRE, BFGS, or LBFGS."
+            "Batched optimization evaluates structures only between optimizer "
+            "steps, but an evaluation was requested inside step(). Use an "
+            "optimizer such as FIRE, BFGS, or LBFGS, and disable NEB options "
+            "that move images while computing forces."
         )
 
 

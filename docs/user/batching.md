@@ -29,6 +29,27 @@ converged = [state["converged"] for state in states]
 
 Each returned dictionary holds `converged`, `steps`, and the final `energy`, `forces`, and, with a cell filter, `stress`. The optimizer must read forces once per step at the current positions, as `FIRE`, `BFGS`, and `LBFGS` do. Line-search optimizers such as `BFGSLineSearch` evaluate trial positions inside a step and are rejected. In native batches each structure keeps a neighbor list built at the model cutoff plus `neighbor_skin` (0.5 A by default) and rebuilds it when an atom moves by more than half the skin or the cell changes. In FP64 each structure follows the trajectory of an independent ASE relaxation with the same optimizer to rounding. FP32 trajectories can drift slightly and reach the same minimum within FP32 tolerance.
 
+## Nudged elastic band
+
+`Symmetrix.neb_batch` optimizes one or more ASE NEB bands with one batched evaluation per optimizer step. Each step evaluates every image that moved, across all bands, together; the fixed endpoints are evaluated once.
+
+```python
+from ase.mep import NEB, NEBTools
+from ase.optimize import FIRE
+
+bands = []
+for initial, final in paths:
+    images = [initial] + [initial.copy() for _ in range(5)] + [final]
+    band = NEB(images, climb=True)
+    band.interpolate()
+    bands.append(band)
+
+states = calc.neb_batch(bands, fmax=0.05, steps=500, optimizer=FIRE)
+barrier = NEBTools(bands[0].images).get_barrier()
+```
+
+Each returned dictionary holds `converged`, `steps`, and the image `energies`. Every image keeps a read-only result calculator after the run, so `NEBTools` can read the final energies and forces. Bands are built as usual, without attaching a calculator. Options that move images while forces are computed, `remove_rotation_and_translation=True` and dynamic relaxation, are rejected. In FP64 each band follows the trajectory of the same ASE NEB evaluated image by image to rounding.
+
 ## Performance
 
 A native batch pays the fixed cost of an evaluation (kernel submissions, synchronization, and host bookkeeping) once per batch instead of once per structure. It therefore helps most when a single small structure leaves a GPU underused. On one CPU core the cost already scales with the edge count, and batching saves only the per-call overhead.

@@ -449,3 +449,113 @@ def test_batched_relaxation_reuses_skinned_neighbor_lists(fp64_calculator, monke
     for atoms, state, other, expected in zip(structures, states, rebuilt, reference):
         assert state["steps"] == expected["steps"]
         np.testing.assert_allclose(atoms.positions, other.positions, atol=1e-8)
+
+
+def _vacancy_hop_images(oxygen=0, neighbor_rank=0, interior=3):
+    """Images of an oxygen-vacancy hop in a 2x2x2 SrTiO3 supercell."""
+    lattice = _perovskite()
+    oxygens = np.flatnonzero(lattice.numbers == 8)
+    vacancy = oxygens[oxygen]
+    distances = lattice.get_distances(vacancy, oxygens, mic=True)
+    hopping = oxygens[np.argsort(distances)[1 + neighbor_rank]]
+    initial = lattice.copy()
+    del initial[vacancy]
+    moved = hopping - (hopping > vacancy)
+    final = initial.copy()
+    target = lattice.positions[vacancy]
+    shift = target - final.positions[moved]
+    shift -= final.cell.array.T @ np.round(np.linalg.solve(final.cell.array.T, shift))
+    final.positions[moved] += shift
+    return [initial] + [initial.copy() for _ in range(interior)] + [final]
+
+
+def _neb(images, **kwargs):
+    from ase.mep import NEB
+
+    band = NEB(images, **kwargs)
+    band.interpolate()
+    return band
+
+
+@pytest.mark.parametrize("climb", [False, True])
+def test_batched_neb_follows_ase_neb(fp64_calculator, climb):
+    from ase.optimize import FIRE
+
+    reference_images = _vacancy_hop_images()
+    for image in reference_images:
+        image.calc = fp64_calculator
+    reference = _neb(reference_images, climb=climb, allow_shared_calculator=True)
+    dynamics = FIRE(reference, logfile=None)
+    converged = dynamics.run(fmax=0.05, steps=15)
+
+    images = _vacancy_hop_images()
+    band = _neb(images, climb=climb)
+    states = fp64_calculator.neb_batch([band], fmax=0.05, steps=15)
+
+    assert states[0]["converged"] == converged
+    assert states[0]["steps"] == dynamics.nsteps
+    for image, expected in zip(images, reference_images):
+        np.testing.assert_allclose(image.positions, expected.positions, atol=1e-8)
+    np.testing.assert_allclose(
+        states[0]["energies"],
+        [image.get_potential_energy() for image in reference_images],
+        atol=1e-8,
+    )
+
+
+def test_batched_nebs_share_one_evaluation_per_step(fp64_calculator, monkeypatch):
+    from ase.optimize import FIRE
+
+    references = []
+    for oxygen in (0, 5):
+        images = _vacancy_hop_images(oxygen=oxygen)
+        for image in images:
+            image.calc = fp64_calculator
+        band = _neb(images, allow_shared_calculator=True)
+        FIRE(band, logfile=None).run(fmax=0.05, steps=8)
+        references.append(images)
+
+    bands = [_neb(_vacancy_hop_images(oxygen=oxygen)) for oxygen in (0, 5)]
+    evaluator = BatchEvaluator(fp64_calculator)
+    sizes = []
+    original = evaluator._calculate
+
+    def counting(structures, properties, graphs=None):
+        sizes.append(len(structures))
+        return original(structures, properties, graphs)
+
+    monkeypatch.setattr(evaluator, "_calculate", counting)
+    states = evaluator.neb(bands, fmax=0.05, steps=8)
+
+    # The first batch includes the four fixed endpoints; later batches hold
+    # only the moving interior images of the bands still running.
+    assert sizes[0] == 10
+    assert all(size <= 6 for size in sizes[1:])
+    for band, images, state in zip(bands, references, states):
+        assert state["energies"].shape == (5,)
+        for image, expected in zip(band.images, images):
+            np.testing.assert_allclose(image.positions, expected.positions, atol=1e-8)
+
+
+def test_batched_neb_rejects_evaluations_inside_a_step(fp64_calculator):
+    band = _neb(_vacancy_hop_images(), remove_rotation_and_translation=True)
+    with pytest.raises(RuntimeError, match="inside step"):
+        fp64_calculator.neb_batch([band], steps=3)
+
+
+def test_native_metal_neb_matches_host_fp32(omat_small_model):
+    available, reason = _metal_available()
+    if not available:
+        pytest.skip(reason)
+    host = Symmetrix(omat_small_model, species=SPECIES, dtype="float32")
+    metal = Symmetrix(omat_small_model, species=SPECIES, dtype="float32", metal=True)
+    host_band = _neb(_vacancy_hop_images(), climb=True)
+    metal_band = _neb(_vacancy_hop_images(), climb=True)
+
+    expected = host.neb_batch([host_band], fmax=0.05, steps=10)[0]
+    state = metal.neb_batch([metal_band], fmax=0.05, steps=10)[0]
+
+    assert metal.metal_status == "ready"
+    assert state["steps"] == expected["steps"]
+    # FP32 summation order differs between the host owners and the GPU.
+    np.testing.assert_allclose(state["energies"], expected["energies"], atol=2e-3)

@@ -3990,6 +3990,19 @@ class Symmetrix(Calculator):
             structures, fmax=fmax, steps=steps, **kwargs
         )
 
+    def neb_batch(self, nebs, fmax=0.05, steps=500, batch_mode="native", **kwargs):
+        """Optimize ASE NEB bands with one batched evaluation per step.
+
+        Keyword arguments are passed to
+        :meth:`symmetrix.batch.BatchEvaluator.neb`.
+        """
+        evaluators = self.__dict__.setdefault("_batch_evaluators", {})
+        if batch_mode not in evaluators:
+            from .batch import BatchEvaluator
+
+            evaluators[batch_mode] = BatchEvaluator(self, batch_mode=batch_mode)
+        return evaluators[batch_mode].neb(nebs, fmax=fmax, steps=steps, **kwargs)
+
 
 class FieldContributionCalculator(Calculator):
     """Return the exact finite-field contribution of a MACEField calculator.
