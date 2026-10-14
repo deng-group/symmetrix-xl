@@ -181,9 +181,11 @@ def test_neighbor_cache_size_bounds_entries(fp64_calculator):
 
     assert len(uncached._neighbor_cache) == 0
     assert len(bounded._neighbor_cache) == 2
+    # Threaded backends (OpenMP, CUDA) sum in a nondeterministic order, so
+    # repeated evaluations of one graph agree to rounding, not bitwise.
     for result, expected in zip(results, reference):
         for key in properties:
-            np.testing.assert_array_equal(result[key], expected[key])
+            np.testing.assert_allclose(result[key], expected[key], rtol=0.0, atol=1e-12)
 
 
 def test_batch_rejects_invalid_requests(fp64_calculator):
