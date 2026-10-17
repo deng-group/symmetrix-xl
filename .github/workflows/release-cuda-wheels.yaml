@@ -148,3 +148,5 @@ jobs:
           packages-dir: wheelhouse
           attestations: true
           skip-existing: true
+
+# Registered in the deng-group fork so the workflow can be dispatched on its branches.
