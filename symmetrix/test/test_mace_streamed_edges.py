@@ -1,6 +1,7 @@
 import copy
 import gc
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,10 @@ from compact_r1_model import foundation_r1_test_model
 from debug_jit import debug_factorized_symmetrix
 from scipy.interpolate import CubicSpline
 from symmetrix import Symmetrix
+from symmetrix import (
+    prepare_jit_device_artifact,
+    prepare_jit_host_artifact,
+)
 from symmetrix import symmetrix as native_symmetrix
 from symmetrix.execution_contract import make_standard_m0_contract
 
@@ -27,6 +32,14 @@ except ImportError as exc:
 _EXECUTION_FIXED_WEIGHT_EXECUTION_SPACES = frozenset(
     {"Cuda", "HIP", "OpenMP", "Serial"}
 )
+
+# Measured receiver/feature high-water increment for the 128-node MACE float32
+# direct plan (per-node forward and adjoint state). The planner admits
+# receiver/feature headroom only from post-reserve bytes beyond the exact
+# estimate, and a capacity-policy budget spends its whole speed-capacity window
+# (measured 2448 B for the 12-edge graph here) on edge headroom first, so
+# in-capacity node growth needs a speed-policy budget with this headroom.
+_RECEIVER_FEATURE_INCREMENT_BYTES = 46_752
 
 
 def _kokkos_execution_space():
@@ -49,11 +62,59 @@ def _require_execution_fixed_weight_backend():
     return execution_space
 
 
-def _require_receiver_factorized_host_backend():
-    execution_space = _kokkos_execution_space()
-    if execution_space not in ("OpenMP", "Serial"):
-        pytest.skip("receiver-factorized RTC requires Kokkos OpenMP or Serial")
-    return execution_space
+def _skip_removed_observer_gradient_support():
+    """Execution observers and parameter gradients lost their execution mode.
+
+    Both features require the receiver-factorized path, which was removed:
+    ``begin_factorized_production_evaluation`` rejects them for the surviving
+    direct path.
+    """
+
+    pytest.skip(
+        "Execution observers and parameter gradients require the removed "
+        "receiver-factorized path; direct execution rejects them"
+    )
+
+
+def _pin_forward_mh0_state(evaluator):
+    """Keep the M0/M1/A0/A1 forward buffers readable across an evaluation.
+
+    The throughput-qualified speed bundle requests MH-0 adjoint reuse, and that
+    request is honored exactly while a state-free M0 implementation is selected
+    (the built-in standard module). Under ``reuse-adjoints-v1`` the forward
+    buffers are aliased to their adjoint storage, so ``A0``, ``M0``, ``A1`` and
+    ``M1`` hold adjoints once an evaluation returns - measured for this graph:
+    the exposed ``A0`` is bit-identical to the reverse ``A0_adj``. Forward-state
+    oracles must therefore compare two executors under the same retention
+    policy; the reuse policy itself is covered by
+    ``test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back`` and
+    ``test_scalar_standard_m0_low_memory_matches_retained_direct``.
+    """
+
+    evaluator._set_mh0_state_policy("full-retention-v1")
+
+
+def _load_direct_artifact(evaluator, model_path, dtype="float64"):
+    """Prepare and load the generated plugin a direct evaluator needs."""
+
+    execution_space = native_symmetrix._kokkos_default_execution_space()
+    if execution_space in ("OpenMP", "Serial"):
+        artifact = prepare_jit_host_artifact(model_path, precision=dtype)
+        evaluator._load_jit_host_plugin(str(artifact.artifact_path))
+    elif execution_space in ("Cuda", "HIP"):
+        backend = execution_space.lower()
+        artifact = prepare_jit_device_artifact(
+            model_path, precision=dtype, backend=backend
+        )
+        loader = getattr(evaluator, f"_load_jit_{backend}_plugin")
+        if backend == "cuda":
+            loader(
+                str(artifact.artifact_path),
+                artifact.edge_policy["persistent_blocks_per_compute_unit"],
+            )
+        else:
+            loader(str(artifact.artifact_path))
+    evaluator.set_streamed_edges("direct")
 
 
 @pytest.fixture(scope="module")
@@ -348,7 +409,7 @@ def test_field_coupled_models_expose_backend_appropriate_streamed_modes(
             "generic" if mode == "all_interactions" else mode
         )
     with pytest.raises(
-        ValueError, match="direct and receiver_factorized require the Kokkos evaluator"
+        ValueError, match="direct execution requires the Kokkos evaluator"
     ):
         serial.set_streamed_edges("factorized")
 
@@ -837,7 +898,7 @@ def test_execution_parameter_gradient_boundary_is_opt_in_and_model_sized(
     if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
     evaluator = native_symmetrix.MACEKokkos(str(standard_path))
-    evaluator.set_streamed_edges("receiver_factorized")
+    evaluator.set_streamed_edges("direct")
 
     assert not evaluator.execution_parameter_gradients_enabled
     assert evaluator.factorized_derivative_signature == "factorized_coordinate"
@@ -910,17 +971,48 @@ def test_execution_parameter_gradient_boundary_is_opt_in_and_model_sized(
     assert evaluator.execution_parameter_gradients()["groups"] == []
 
 
+def test_direct_execution_rejects_parameter_gradients(streamed_model_paths):
+    """The surviving direct path must refuse parameter gradients explicitly."""
+
+    standard_path, _ = streamed_model_paths
+    atoms = _small_structure()
+    calculator = Symmetrix(
+        standard_path,
+        use_kokkos=True,
+        dtype="float64",
+        streamed_edges="direct",
+    )
+    evaluator = calculator.evaluator
+    if _kokkos_execution_space() in ("OpenMP", "Serial"):
+        # A host execution space has no device-memory query, so the low-memory
+        # request is served by the capacity bundle, whose MH-0 adjoint reuse
+        # needs a state-free R0 (`use_r0_module` excludes parameter gradients,
+        # mace_kokkos_runtime.cpp:5048). That admission refuses first, before
+        # `begin_factorized_production_evaluation` reaches its direct-mode
+        # observer/gradient guard.
+        expected_message = "MH-0 adjoint reuse requires a state-free R0 implementation"
+    else:
+        expected_message = "does not support Execution observers or parameter gradients"
+    evaluator.set_execution_parameter_gradients(True)
+    try:
+        with pytest.raises(ValueError, match=expected_message):
+            calculator.calculate(atoms, properties=["energy"])
+    finally:
+        del calculator
+        gc.collect()
+
+
 def test_execution_interaction_parameter_replay_populates_equation_36_groups(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -956,14 +1048,14 @@ def test_execution_interaction_parameter_replay_populates_equation_36_groups(
 def test_execution_field_parameter_replay_completes_interaction_groups(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     _, field_path = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         field_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -994,11 +1086,12 @@ def test_execution_parameter_replay_handles_zero_and_one_directed_edge(
     streamed_model_paths,
     edge_count,
 ):
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
     evaluator = native_symmetrix.MACEKokkos(str(standard_path))
-    evaluator.set_streamed_edges("receiver_factorized")
+    _load_direct_artifact(evaluator, standard_path)
     evaluator.set_execution_parameter_gradients(True)
     if edge_count == 0:
         native_args = (
@@ -1033,14 +1126,14 @@ def test_execution_parameter_replay_handles_zero_and_one_directed_edge(
 def test_execution_parameter_replay_supports_prepared_graph_tokens(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -1090,20 +1183,20 @@ def test_execution_parameter_replay_supports_prepared_graph_tokens(
 def test_execution_parameter_replay_ignores_skin_only_edges(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     candidate = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
         neighbor_skin=0.5,
     )
     exact = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
         neighbor_skin=0.0,
     )
     atoms = Atoms(
@@ -1145,14 +1238,14 @@ def test_execution_parameter_replay_ignores_skin_only_edges(
 def test_execution_native_parameter_replay_matches_tiled_float32(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -1182,7 +1275,7 @@ def test_execution_interaction_parameter_replay_matches_energy_finite_difference
     streamed_model_paths,
     tmp_path,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     model = json.loads(standard_path.read_text())
     atoms = _small_structure()
@@ -1194,7 +1287,7 @@ def test_execution_interaction_parameter_replay_matches_energy_finite_difference
             path,
             use_kokkos=True,
             dtype="float32",
-            streamed_edges="receiver_factorized",
+            streamed_edges="direct",
         )
         inputs = calculator._mace_inputs(atoms)
         native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
@@ -1300,12 +1393,13 @@ def test_native_evaluators_reject_removed_second_interaction(streamed_model_path
         kokkos.set_streamed_edges("second_interaction")
 
 
-def test_serial_evaluator_rejects_factorized(streamed_model_paths):
+def test_serial_evaluator_downgrades_factorized_to_generic(streamed_model_paths):
     standard_path, _ = streamed_model_paths
-    with pytest.raises(
-        ValueError, match="direct and receiver_factorized require the Kokkos evaluator"
-    ):
-        Symmetrix(standard_path, use_kokkos=False, streamed_edges="factorized")
+    with pytest.warns(RuntimeWarning, match="serial non-compiled"):
+        calculator = Symmetrix(
+            standard_path, use_kokkos=False, streamed_edges="factorized"
+        )
+    assert calculator.streamed_edges == "generic"
 
 
 @pytest.mark.parametrize("dtype,atol", [("float64", 3e-11), ("float32", 3e-5)])
@@ -1740,6 +1834,7 @@ def test_execution_standard_m0_matches_runtime_forward_reverse_oracle(
         evaluator._set_factorized_direct_forward_executor("jit_all")
         evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
+    _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
@@ -2077,7 +2172,9 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
         m1_polynomial_policy="retained",
     )
     evaluator = calculator.evaluator
-    assert evaluator.m1_polynomial_policy == "retained"
+    # Construction runs the throughput-qualified speed bundle, which pins M1
+    # recomputation; evaluate() below re-applies the retained policy and
+    # asserts the retained-only counters that this comparison owns.
     assert evaluator.m1_recompute_tile_channels in (8, 16, 32)
     if streamed_edges == "factorized":
         evaluator._set_factorized_source_strategy("jit_plugin")
@@ -2085,6 +2182,7 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
         evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
     evaluator._set_standard_m0_executor("standard")
+    _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
@@ -2298,7 +2396,8 @@ def test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back(
     assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
     assert evaluator.mh0_state_policy_fallback_reason == ""
     assert evaluator.mh0_reused_state_bytes == expected_reused_bytes
-    assert evaluator.mh0_auxiliary_state_bytes == 16 * len(atoms)
+    # Per-atom doubles: A1 scale adjoint, A0 scale adjoint, A1 inverse scale.
+    assert evaluator.mh0_auxiliary_state_bytes == 24 * len(atoms)
     assert reused["energy"] == pytest.approx(retained["energy"], rel=0.0, abs=3e-5)
     for name in ("energies", "forces", "stress"):
         np.testing.assert_allclose(reused[name], retained[name], rtol=0.0, atol=3e-5)
@@ -2312,7 +2411,12 @@ def test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back(
         "a state-free M0 implementation is not active"
     )
     assert evaluator.mh0_reused_state_bytes == 0
-    assert evaluator.mh0_auxiliary_state_bytes == 0
+    # The policy rollback drops the two adjoint-only scale buffers but keeps the
+    # always-allocated A1 inverse-scale forward buffer: one double per receiver,
+    # measured 8*4 B for this four-atom graph (and 8*N when N nodes are used).
+    assert evaluator.mh0_auxiliary_state_bytes == (
+        np.dtype(np.float64).itemsize * len(atoms)
+    )
     assert not evaluator.h1_m0_adjoint_ping_pong_active
     assert evaluator.h1_m0_adjoint_ping_pong_bytes == 0
     assert fallback["energy"] == pytest.approx(retained["energy"], rel=0.0, abs=3e-5)
@@ -2323,7 +2427,10 @@ def test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back(
     restored = evaluate("full-retention-v1")
     assert evaluator.mh0_state_policy == "full-retention-v1"
     assert evaluator.mh0_reused_state_bytes == 0
-    assert evaluator.mh0_auxiliary_state_bytes == 0
+    # Same forward-buffer floor as the fallback state above.
+    assert evaluator.mh0_auxiliary_state_bytes == (
+        np.dtype(np.float64).itemsize * len(atoms)
+    )
     assert not evaluator.h1_m0_adjoint_ping_pong_active
     assert evaluator.h1_m0_adjoint_ping_pong_bytes == 0
     assert restored["energy"] == retained["energy"]
@@ -2369,6 +2476,9 @@ def test_factorized_low_memory_bundle_matches_full_retention_and_is_transactiona
         streamed_edges="factorized",
         low_memory=True,
     )
+    # The speed bundle pins readout recomputation; restore the retained policy
+    # this comparison depends on.
+    retained.evaluator._set_readout_policy("retained")
     execution_space = native_symmetrix._kokkos_default_execution_space()
     if execution_space in ("Cuda", "HIP"):
         device_bytes = 32 * 1024**3
@@ -2476,13 +2586,15 @@ def test_factorized_low_memory_bundle_matches_full_retention_and_is_transactiona
     evaluator._set_m1_recompute_tile_channels(8)
     evaluator._set_m1_polynomial_policy("recompute")
     minimum_scratch = evaluator.m1_recompute_scratch_bytes
-    evaluator._set_m1_polynomial_policy("retained")
     if minimum_scratch == 0:
+        # The low-memory request requires M1 recomputation, so this branch must
+        # not leave M1 pinned to the retained policy it is compared against.
         assert evaluator.standard_m1_module_ready
         evaluator._set_low_memory(True)
         assert evaluator.low_memory is True
         evaluator._set_low_memory(False)
     else:
+        evaluator._set_m1_polynomial_policy("retained")
         evaluator._set_m1_recompute_scratch_limit_for_testing(minimum_scratch - 1)
         with pytest.raises(
             ValueError, match=r"requires (?:at least )?.*scratch bytes.*tile 8"
@@ -2537,7 +2649,15 @@ def test_low_memory_selects_speed_or_capacity_from_graph_memory_estimate(
         "unit-f32-radius-f64-v1" if dtype == "float32" else "cartesian-f64-v1"
     )
     assert evaluator.low_memory_speed_estimated_bytes > 0
+    # The speed selection ("speed selection: estimated speed graph bytes fit
+    # available device memory after reserve") was followed by the post-reserve
+    # high-water admission ("admitted 0.25% repeated-run high-water within
+    # post-reserve bytes; active=(4,4,12), previous=(0,0,0), planned=(68,68,76)"),
+    # so the selected estimate is the admitted plan, above the exact estimate.
     assert evaluator.low_memory_selected_estimated_bytes == (
+        evaluator.execution_planned_capacity_bytes
+    )
+    assert evaluator.low_memory_selected_estimated_bytes > (
         evaluator.low_memory_speed_estimated_bytes
     )
     calculator._sync_low_memory_policy_state()
@@ -2710,6 +2830,75 @@ def test_speed_uses_backend_throughput_policy_and_debug_override_is_exact(
     assert "debug override selected" in retained.low_memory_selection_reason
 
 
+def test_explicit_evaluator_policy_pins_survive_the_automatic_bundle(
+    streamed_model_paths,
+):
+    """A pin set through the evaluator must not be reverted by the bundle."""
+
+    standard_path, _ = streamed_model_paths
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator = Symmetrix(
+        standard_path,
+        use_kokkos=True,
+        dtype="float64",
+        streamed_edges="factorized",
+    )
+    evaluator = calculator.evaluator
+    evaluator._set_readout_policy("retained")
+    calculator.calculate(atoms, properties=["energy", "forces", "stress"])
+    assert evaluator.readout_policy == "retained"
+    assert evaluator.readout_workspace_bytes > 0
+
+
+def test_pinned_harmonic_storage_survives_indirect_bundle_writes(
+    streamed_model_paths,
+    monkeypatch,
+    tmp_path,
+):
+    """A pinned harmonic policy must outlive the bundle's indirect writers."""
+
+    _require_execution_fixed_weight_backend()
+
+    standard_path, _ = streamed_model_paths
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+    calculator = Symmetrix(
+        standard_path,
+        use_kokkos=True,
+        dtype="float32",
+        streamed_edges="factorized",
+        execution_profile="speed",
+    )
+    evaluator = calculator.evaluator
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator.calculate(atoms, properties=["energy", "forces", "stress"])
+    assert evaluator.harmonic_storage_policy == "retained"
+    # Admission is capability based: the resolved plan selects compact
+    # unit-direction geometry, so the Y-only pin is accepted.
+    evaluator._set_harmonic_storage_policy("y-only-direct-v1")
+    assert evaluator.harmonic_storage_policy == "y-only-direct-v1"
+
+    # The speed profile resolves its plan by disabling the low-memory request,
+    # whose bundle run used to reset the harmonic storage behind the pin.
+    evaluator._resolve_execution_plan()
+    assert evaluator.harmonic_storage_policy_request == "y-only-direct-v1"
+
+    # The companion write is the terminal reset of set_low_memory(False),
+    # touched here directly and again through the plan resolution above. It
+    # leaves Cartesian geometry, which masks an admissible Y-only policy, so
+    # the pin is asserted on the ungated request until a fresh bundle run
+    # restores compact geometry.
+    evaluator._set_low_memory(False)
+    assert evaluator.harmonic_storage_policy_request == "y-only-direct-v1"
+
+    displaced = _small_structure()
+    displaced.set_pbc(True)
+    displaced.positions[0] = [0.0, 0.0, 0.05]
+    calculator.calculate(displaced, properties=["energy", "forces", "stress"])
+    assert evaluator.harmonic_storage_policy == "y-only-direct-v1"
+
+
 def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     streamed_model_paths,
     monkeypatch,
@@ -2752,16 +2941,18 @@ def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     capacity_estimate = evaluator.low_memory_capacity_estimated_bytes
     speed_estimate = evaluator.low_memory_speed_estimated_bytes
     reserve = device_bytes // 20
-    admitted_headroom = speed_estimate - capacity_estimate - 1
-    assert admitted_headroom > 0
-    # Changing the synthetic device limit invalidates the prepared graph, so
-    # no previous selected allocation is reclaimable by the next admission.
-    constrained_free = reserve + capacity_estimate + admitted_headroom
+    # A capacity-policy budget (post-reserve bytes below the speed estimate)
+    # spends its whole speed-capacity window on edge headroom, so its plan can
+    # never cover node growth; the speed policy admits the receiver/feature
+    # high-water ("planned=(129,129,76)" for the 128-node active graph) out of
+    # the wider post-reserve budget. Two increments cover the re-plan at the
+    # grown 129-node active size.
+    constrained_free = reserve + speed_estimate + 2 * _RECEIVER_FEATURE_INCREMENT_BYTES
     assert 0 < constrained_free < device_bytes
 
-    # Use a fresh evaluator for admission. The estimator above deliberately
-    # selected the speed policy and established an exact active-size plan;
-    # retained plans are reused unchanged until active size exceeds them.
+    # Use a fresh evaluator for admission: changing the synthetic device limit
+    # invalidates the prepared graph, so no previous selected allocation is
+    # reclaimable by the next admission (previous=(0,0,0) in the reason above).
     del evaluator
     del calculator
     gc.collect()
@@ -2794,8 +2985,11 @@ def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     evaluator._compute_prepared_factorized(
         token, np.asarray(reordered[5]).reshape(-1), reordered[6]
     )
-    assert evaluator.low_memory_policy.startswith("capacity-")
-    assert evaluator.execution_planned_receiver_capacity > inputs[0], {
+    # "speed selection: estimated speed graph bytes fit available device memory
+    # after reserve": the high-water admission that covers the growth below
+    # needs the speed policy's wider post-reserve budget.
+    assert evaluator.low_memory_policy == "speed"
+    assert evaluator.execution_planned_receiver_capacity >= inputs[0], {
         "capacity_estimate": capacity_estimate,
         "speed_estimate": speed_estimate,
         "available": evaluator.low_memory_available_bytes,
@@ -2968,10 +3162,12 @@ def test_low_memory_high_water_reuses_prepared_geometry_state_capacity(
     evaluator._prepare_factorized_graph(
         base_nodes, node_types, num_neigh, small_inputs[3], small_inputs[4]
     )
-    capacity_estimate = evaluator.low_memory_capacity_estimated_bytes
     speed_estimate = evaluator.low_memory_speed_estimated_bytes
+    # See test_low_memory_high_water_reuses_graph_and_mh0_state_capacity: the
+    # speed policy's wider post-reserve budget is what admits the
+    # receiver/feature high-water the 129-node growth below reuses.
     constrained_free = (
-        device_bytes // 20 + capacity_estimate + speed_estimate - capacity_estimate - 1
+        device_bytes // 20 + speed_estimate + 2 * _RECEIVER_FEATURE_INCREMENT_BYTES
     )
 
     del evaluator
@@ -3004,8 +3200,11 @@ def test_low_memory_high_water_reuses_prepared_geometry_state_capacity(
         np.zeros(3, dtype=np.int32),
     )
     geometry_allocations = evaluator.factorized_geometry_state_allocation_count
-    assert evaluator.execution_planned_receiver_capacity > base_nodes
-    assert evaluator.execution_planned_edge_capacity > len(small_inputs[3])
+    # "admitted 0.25% repeated-run high-water within post-reserve bytes;
+    # active=(128,128,12), previous=(0,0,0), planned=(129,129,76)": the admitted
+    # plan already covers the single-node growth below.
+    assert evaluator.execution_planned_receiver_capacity >= base_nodes
+    assert evaluator.execution_planned_edge_capacity >= len(small_inputs[3])
 
     simulated_free_after_allocation = (
         constrained_free - evaluator.execution_planned_capacity_bytes
@@ -3072,8 +3271,13 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
     probe_initial_capacity = probe.execution_geometry_capacity_edges
     probe._prepare_factorized_graph(*probe_repeated)
     exact_repeated_estimate = probe.low_memory_speed_estimated_bytes
-    assert probe.execution_geometry_capacity_edges == 2 * probe_initial_capacity
-    assert probe.low_memory_selected_estimated_bytes > exact_repeated_estimate
+    # The speed plan fits the grown graph exactly instead of doubling.
+    assert probe.execution_geometry_capacity_edges == len(probe_repeated[3])
+    assert probe.execution_geometry_capacity_edges >= probe_initial_capacity
+    # "low_memory=False: exact speed graph fits advisory device-memory budget":
+    # a speed request never runs the post-reserve high-water admission, so the
+    # selected estimate is the exact speed estimate of the repeated graph.
+    assert probe.low_memory_selected_estimated_bytes == exact_repeated_estimate
 
     calculator = Symmetrix(
         standard_path,
@@ -3096,7 +3300,10 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
     )
 
     evaluator._prepare_factorized_graph(*repeated)
-    assert evaluator.low_memory_policy == "disabled"
+    # The speed request records the throughput plan ("mh0-direct-speed",
+    # "low_memory=False: exact speed graph fits advisory device-memory budget"),
+    # so the policy label is "speed", not the unused "disabled".
+    assert evaluator.low_memory_policy == "speed"
     assert evaluator.execution_geometry_capacity_edges == len(repeated[3])
     assert evaluator.low_memory_selected_estimated_bytes == (
         evaluator.low_memory_speed_estimated_bytes
@@ -3120,7 +3327,7 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
     )
     evaluator._set_low_memory_device_memory_info_for_testing(1, device_bytes)
     evaluator._prepare_factorized_graph(*too_large)
-    assert evaluator.low_memory_policy == "disabled"
+    assert evaluator.low_memory_policy == "speed"
     assert evaluator.execution_geometry_capacity_edges == len(too_large[3])
     assert evaluator.low_memory_selected_estimated_bytes == (
         evaluator.low_memory_speed_estimated_bytes
@@ -3369,6 +3576,7 @@ def test_execution_structural_m0_generalizes_species_count(
     evaluator._set_factorized_direct_forward_executor("jit_all")
     evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
+    _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
@@ -3657,7 +3865,19 @@ def test_generic_fp32_source_adjoint_workspace_is_reused(streamed_model_paths):
     assert evaluator.generic_phi1_source_adjoint_workspace_bytes == expected_bytes
     assert evaluator.generic_phi1_source_adjoint_allocation_count == 1
     for name in first:
-        np.testing.assert_array_equal(calculator.results[name], first[name])
+        # The reused workspace must not change the results, but the host force
+        # reduction accumulates in OpenMP work-sharing order, so repeated
+        # evaluations of one graph agree only to reduction-order rounding
+        # (measured <= 1 ULP of the result magnitude; bitwise identical with
+        # OMP_NUM_THREADS=1). The reuse contract itself is the byte and
+        # allocation assertions above.
+        magnitude = float(np.max(np.abs(first[name])))
+        np.testing.assert_allclose(
+            calculator.results[name],
+            first[name],
+            rtol=0.0,
+            atol=4.0 * float(np.spacing(magnitude)),
+        )
 
 
 def test_execution_standard_r0_v2_state_clears_on_mode_switch(
@@ -3845,14 +4065,14 @@ def test_factorized_exact_artifact_is_bound_to_loaded_phi_payload(
 def test_factorized_observer_matches_reference_across_execution_strategies(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -3974,19 +4194,19 @@ def test_factorized_observer_matches_reference_across_execution_strategies(
 def test_factorized_observer_rejects_capture_above_host_byte_limit(
     streamed_model_paths,
 ):
-    _require_receiver_factorized_host_backend()
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
         use_kokkos=True,
         dtype="float32",
-        streamed_edges="receiver_factorized",
+        streamed_edges="direct",
     )
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
     evaluator = calculator.evaluator
-    evaluator.set_streamed_edges("receiver_factorized")
+    evaluator.set_streamed_edges("direct")
     evaluator._set_factorized_observer(True, max_bytes=1)
 
     with pytest.raises(ValueError, match="observer requires.*exceeding"):
@@ -4059,6 +4279,7 @@ def test_factorized_source_schedule_reuses_and_rebuilds_with_topology(
 
 
 def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
@@ -4169,8 +4390,26 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         assert evaluator.execution_phi1r_capacity_bytes == 0
         assert evaluator.execution_dphi1r_active_bytes == 0
         assert evaluator.execution_dphi1r_capacity_bytes == 0
-        assert evaluator.factorized_custom_blas_launch_count == 0
-        assert evaluator.factorized_blas_stream_bind_count == 0
+        requested_a1_cublas = os.environ.get("SYMMETRIX_A1_CUBLAS", "")
+        a1_cublas_enabled = requested_a1_cublas in ("", "1", "true", "on")
+        device_environment = getattr(
+            evaluator, "execution_device_execution_environment", {}
+        )
+        batched_blas_available = (
+            device_environment.get("batched_blas_available", False)
+            if isinstance(device_environment, dict)
+            else False
+        )
+        if (
+            _kokkos_execution_space() in ("Cuda", "HIP")
+            and a1_cublas_enabled
+            and batched_blas_available
+        ):
+            assert evaluator.factorized_custom_blas_launch_count > 0
+            assert evaluator.factorized_blas_stream_bind_count == 1
+        else:
+            assert evaluator.factorized_custom_blas_launch_count == 0
+            assert evaluator.factorized_blas_stream_bind_count == 0
 
     evaluator._set_factorized_planner_budget_bytes(evaluator.factorized_workspace_bytes)
     assert evaluator.factorized_graph_generation == 0
@@ -4234,7 +4473,7 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
     assert evaluator.factorized_topology_validation_count == 0
     assert evaluator.execution_sphericart_initialization_count == 1
 
-    evaluator.set_streamed_edges("receiver_factorized")
+    evaluator.set_streamed_edges("direct")
     evaluator._set_factorized_observer(True, max_bytes=1)
     observer_token = evaluator._prepare_factorized_graph(*repeated[:5])
     assert observer_token > repeated_token
@@ -4831,6 +5070,16 @@ def test_execution_direct_float32_force_matches_finite_displacement(
     evaluator._set_standard_r0_executor("v2_edge16")
     reference_inputs = calculator._mace_inputs(atoms)
     token = evaluator._prepare_factorized_graph(*reference_inputs[:5])
+    # Preparing the graph applies the automatic speed bundle, which rewrites the
+    # R0 executor to the host coordinator kernel on a HostSpace execution space
+    # (mace_kokkos_runtime.cpp:3283) while a device space keeps the explicit
+    # v2_edge16 request; both are state-free and only the force parity below is
+    # under test.
+    expected_r0_executor = (
+        "v2_receiver"
+        if _kokkos_execution_space() in ("OpenMP", "Serial")
+        else "v2_edge16"
+    )
 
     def evaluate(candidate_atoms):
         candidate_inputs = calculator._mace_inputs(candidate_atoms)
@@ -4843,7 +5092,7 @@ def test_execution_direct_float32_force_matches_finite_displacement(
         )
         assert evaluator.factorized_execution_profile == "direct_fixed_weight"
         assert evaluator.factorized_selected_direct_reverse_executor == "jit"
-        assert evaluator.standard_r0_selected_executor == "v2_edge16"
+        assert evaluator.standard_r0_selected_executor == expected_r0_executor
         return calculator._collect_mace_results(candidate_atoms, candidate_inputs)
 
     reference = evaluate(atoms)
@@ -4868,6 +5117,7 @@ def test_execution_direct_float32_force_matches_finite_displacement(
 def test_execution_direct_reenters_after_tight_budget_factorized_workspace(
     streamed_model_paths,
 ):
+    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
@@ -4897,7 +5147,7 @@ def test_execution_direct_reenters_after_tight_budget_factorized_workspace(
     assert evaluator.factorized_schedule_entries == edge_count
     assert evaluator.factorized_schedule_bytes == expected_direct_schedule_bytes
 
-    evaluator.set_streamed_edges("receiver_factorized")
+    evaluator.set_streamed_edges("direct")
     evaluator._set_factorized_observer(True)
     evaluator._set_factorized_planner_budget_bytes(1)
     evaluator.compute_node_energies_forces(*native_args)

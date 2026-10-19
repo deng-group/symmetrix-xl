@@ -204,6 +204,10 @@ void set_readout_policy(std::string policy);
 void set_phi1_policy(std::string policy);
 void set_edge_geometry_policy(std::string policy);
 void set_harmonic_storage_policy(std::string policy);
+// Internal harmonic-storage writes (bundle and consistency resets) decline
+// when the caller pinned the policy through the pybind layer, so a pinned
+// harmonic policy survives for the evaluator's lifetime.
+void apply_harmonic_storage_policy(const char* policy);
 void set_low_memory_device_memory_info_for_testing(
     std::size_t free_bytes, std::size_t total_bytes);
 void set_single_layer_workspace_receiver_limit_for_testing(int receivers);
@@ -334,6 +338,7 @@ std::size_t standard_m0_poly_adjoints_active_bytes() const;
 std::size_t standard_m0_poly_adjoints_capacity_bytes() const;
 std::size_t factorized_forward_coupling_workspace_bytes() const;
 std::size_t factorized_reverse_coupling_workspace_bytes() const;
+std::size_t a1_blas_flatten_workspace_bytes() const;
 std::size_t factorized_custom_blas_launch_count() const;
 std::size_t factorized_blas_stream_bind_count() const;
 std::uint64_t prepare_all_interactions_graph(
@@ -934,6 +939,7 @@ Kokkos::View<Precision***,Kokkos::LayoutRight> field_path_up_matrix;
 Kokkos::View<double*> electric_field_adj;
 Kokkos::View<double*> electric_field_hessian;
 Kokkos::View<double*> electric_field_force_derivative;
+Kokkos::View<double***,Kokkos::LayoutRight> electric_field_bec_bins;
 Kokkos::View<Precision***,Kokkos::LayoutRight> field_H1_pre_adj;
 Kokkos::View<double**,Kokkos::LayoutRight> field_H1_global_partial;
 void compute_field_H1(const int num_nodes, Kokkos::View<const double*> electric_field);
@@ -973,10 +979,21 @@ void compute_current_electric_field_force_derivative(
     Kokkos::View<const double*> r,
     Kokkos::View<const double*> electric_field,
     std::uint64_t graph_generation);
+void compute_current_electric_field_bec_bins(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r,
+    Kokkos::View<const double*> electric_field,
+    std::uint64_t graph_generation);
 void compute_prepared_factorized_field_response(
     std::uint64_t graph_generation,
     Kokkos::View<const double*> electric_field,
-    bool include_force_derivative);
+    bool include_force_derivative,
+    bool scatter_bec_bins = false);
 void compute_electric_field_response(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -987,7 +1004,8 @@ void compute_electric_field_response(
     Kokkos::View<const double*> r,
     Kokkos::View<const double*> electric_field,
     bool recompute_primal,
-    bool include_force_derivative);
+    bool include_force_derivative,
+    bool scatter_bec_bins = false);
 void reconstruct_mh0_field_response_state(
     int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -1036,12 +1054,23 @@ Kokkos::View<int*> Phi1_path_row_offsets;
 
 // A1
 Kokkos::View<Precision***,Kokkos::LayoutRight> A1, A1_adj;
+Kokkos::View<double*> A1_inverse_scale;
+bool a1_scale_factors_ready = false;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace> A1_weights;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace> A1_weights_trans;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>
     A1_channel_tile_weights;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>
     A1_channel_tile_weights_trans;
+// Private staging buffers for the accelerator BLAS A1 path.  The public A1 and
+// Phi1 layouts remain node-major, so direct BLAS still pays a pack/unpack cost.
+// Keep the tile bounded because the staging buffers scale with this extent.
+Kokkos::View<Precision*> A1_blas_flatten_input;
+Kokkos::View<Precision*> A1_blas_flatten_output;
+static constexpr int a1_blas_flatten_tile_nodes = 8192;
+static constexpr int a1_blas_flatten_min_nodes = 512;
+void ensure_a1_blas_flatten_capacity(
+    std::size_t input_elements, std::size_t output_elements);
 static constexpr int phi1_channel_tile_size = 64;
 void compute_A1(int num_nodes, bool completion_fence = true);
 void compute_A1_channel_tile(int num_nodes, int channel_begin);
@@ -1441,6 +1470,14 @@ enum class MH0StatePolicy {
 MH0StatePolicy mh0_state_policy = MH0StatePolicy::full_retention;
 std::string mh0_state_policy_request = "full-retention-v1";
 bool readout_recompute = false;
+// Explicit _set_* requests recorded by the pybind layer. A pinned policy is
+// never rewritten by the automatic throughput bundle, so a caller-selected
+// policy survives calculate(); the flags stay set for the evaluator lifetime.
+bool readout_policy_pinned = false;
+bool m1_polynomial_policy_pinned = false;
+bool mh0_state_policy_pinned = false;
+bool harmonic_storage_policy_pinned = false;
+bool edge_geometry_policy_pinned = false;
 Kokkos::View<double*> mh0_a1_scale_adjoint;
 Kokkos::View<double*> mh0_a0_scale_adjoint;
 bool use_mh0_adjoint_reuse() const;
@@ -1643,6 +1680,12 @@ void compute_A1_scaled(
     Kokkos::View<const int*> num_neigh,
     Kokkos::View<const int*> neigh_types,
     Kokkos::View<const double*> r);
+void prepare_A1_scale_factors(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> r);
 void reverse_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -1677,6 +1720,15 @@ std::size_t macefield_response_phi1_fused_launch_count = 0;
 std::size_t macefield_response_phi1_generic_launch_count = 0;
 std::size_t macefield_response_a0_fused_launch_count = 0;
 std::size_t macefield_response_a0_generic_launch_count = 0;
+std::size_t macefield_response_radial_inline_evaluation_count = 0;
+std::size_t macefield_response_radial_materialized_evaluation_count = 0;
+std::size_t macefield_response_phi1r_slab_launch_count = 0;
+std::size_t macefield_response_phi1r_generic_launch_count = 0;
+bool macefield_response_cg_tables_built = false;
+std::size_t macefield_response_cg_table_build_count = 0;
+Kokkos::View<int*> macefield_response_cg_row_offsets;
+Kokkos::View<Precision*> macefield_response_cg_values;
+Kokkos::View<int*> macefield_response_cg_outputs;
 Kokkos::View<Precision**,Kokkos::LayoutRight> M1, M1_adj;
 Kokkos::View<int**,Kokkos::LayoutRight> M1_monomials;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_weights;

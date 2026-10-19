@@ -2259,18 +2259,29 @@ void MACEKokkos<Precision>::ensure_mh0_a1_forward_capacity(
         ? num_nodes : std::max(num_nodes, execution_planned_receivers);
     if (A1.extent(0) >= static_cast<std::size_t>(capacity)
         && A1.extent_int(1) == num_lm
-        && A1.extent_int(2) == num_channels)
+        && A1.extent_int(2) == num_channels
+        && A1_inverse_scale.extent(0) >= static_cast<std::size_t>(capacity))
         return;
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     execution_space.fence("Replace MH0 A1 forward state");
     if (A1.data() != nullptr && A1_adj.data() == A1.data())
         A1_adj = decltype(A1_adj)();
-    A1 = decltype(A1)();
-    A1 = decltype(A1)(
-        Kokkos::view_alloc(
-            "MH0 A1 forward state", Kokkos::WithoutInitializing),
-        capacity, num_lm, num_channels);
+    const bool a1_shape_ready = A1.extent(0) >= static_cast<std::size_t>(capacity)
+        && A1.extent_int(1) == num_lm
+        && A1.extent_int(2) == num_channels;
+    if (!a1_shape_ready) {
+        A1 = decltype(A1)();
+        A1 = decltype(A1)(
+            Kokkos::view_alloc(
+                "MH0 A1 forward state", Kokkos::WithoutInitializing),
+            capacity, num_lm, num_channels);
+    }
+    if (A1_inverse_scale.extent(0) < static_cast<std::size_t>(capacity))
+        A1_inverse_scale = decltype(A1_inverse_scale)(
+            Kokkos::view_alloc(
+                "MH0 A1 inverse scale", Kokkos::WithoutInitializing),
+            capacity);
 }
 
 template <typename Precision>
@@ -2347,7 +2358,8 @@ template <typename Precision>
 std::size_t MACEKokkos<Precision>::mh0_auxiliary_state_bytes() const
 {
     return sizeof(double)*(
-        mh0_a1_scale_adjoint.size()+mh0_a0_scale_adjoint.size());
+        mh0_a1_scale_adjoint.size()+mh0_a0_scale_adjoint.size()
+        +A1_inverse_scale.size());
 }
 
 template <typename Precision>
@@ -2469,7 +2481,7 @@ void MACEKokkos<Precision>::set_phi1_policy(std::string policy)
         return;
     if (requested == Phi1Policy::receiver_local
         && harmonic_storage_policy == HarmonicStoragePolicy::y_only_direct)
-        set_harmonic_storage_policy("retained");
+        apply_harmonic_storage_policy("retained");
     factorized_execution_space.fence("Change Phi1 policy");
     phi1_policy = requested;
     if (phi1_policy != Phi1Policy::retained) {
@@ -2640,6 +2652,14 @@ void MACEKokkos<Precision>::set_harmonic_storage_policy(std::string policy)
     execution_geometry_capacity_edges = 0;
     execution_geometry_planned_capacity_edges = 0;
     execution_geometry_growth_reason = "geometric growth";
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::apply_harmonic_storage_policy(const char* policy)
+{
+    if (harmonic_storage_policy_pinned)
+        return;
+    set_harmonic_storage_policy(policy);
 }
 
 template <typename Precision>
@@ -3231,29 +3251,40 @@ void MACEKokkos<Precision>::apply_low_memory_policy(
     };
 
     if (!capacity) {
-        select_harmonics(HarmonicStoragePolicy::retained);
+        if (!harmonic_storage_policy_pinned)
+            select_harmonics(HarmonicStoragePolicy::retained);
         set_phi1_policy("retained");
-        set_mh0_state_policy("full-retention-v1");
-        set_m1_polynomial_policy(low_memory_speed_m1_policy_request);
-        set_readout_policy("retained");
-        set_edge_geometry_policy("cartesian-f64-v1");
+        if (!mh0_state_policy_pinned)
+            set_mh0_state_policy("full-retention-v1");
+        if (!m1_polynomial_policy_pinned)
+            set_m1_polynomial_policy(low_memory_speed_m1_policy_request);
+        if (!readout_policy_pinned)
+            set_readout_policy("retained");
+        if (!edge_geometry_policy_pinned)
+            set_edge_geometry_policy("cartesian-f64-v1");
         harmonic_storage_selection_reason =
             "automatic retained selection: speed bundle is active";
     } else {
-        set_m1_polynomial_policy("recompute");
-        set_mh0_state_policy("reuse-adjoints-v1");
+        if (!m1_polynomial_policy_pinned)
+            set_m1_polynomial_policy("recompute");
+        if (!mh0_state_policy_pinned)
+            set_mh0_state_policy("reuse-adjoints-v1");
         set_phi1_policy("retained");
-        if constexpr (std::is_same_v<Precision,float>)
-            set_edge_geometry_policy("unit-f32-radius-f64-v1");
-        else
-            set_edge_geometry_policy("cartesian-f64-v1");
-        set_readout_policy("recompute");
+        if (!edge_geometry_policy_pinned) {
+            if constexpr (std::is_same_v<Precision,float>)
+                set_edge_geometry_policy("unit-f32-radius-f64-v1");
+            else
+                set_edge_geometry_policy("cartesian-f64-v1");
+        }
+        if (!readout_policy_pinned)
+            set_readout_policy("recompute");
         if (symmetrix::standard_r0::host_execution_space<
                 Kokkos::DefaultExecutionSpace>)
             set_standard_r0_executor("v2_receiver");
-        select_harmonics(policy == LowMemoryPolicy::capacity_y_only
-            ? HarmonicStoragePolicy::y_only_direct
-            : HarmonicStoragePolicy::retained);
+        if (!harmonic_storage_policy_pinned)
+            select_harmonics(policy == LowMemoryPolicy::capacity_y_only
+                ? HarmonicStoragePolicy::y_only_direct
+                : HarmonicStoragePolicy::retained);
         harmonic_storage_selection_reason = policy
                 == LowMemoryPolicy::capacity_y_only
             ? "automatic Y-only selection: capacity bundle is active"
@@ -3668,8 +3699,17 @@ void MACEKokkos<Precision>::select_low_memory_policy_for_graph(
     if (capacity_bundle) {
         execution_geometry_planned_capacity_edges = static_cast<int>(num_edges);
         low_memory_selected_estimate = exact_estimate;
-        execution_geometry_growth_reason =
-            "capacity high-water pending post-reserve admission";
+        // Only a low-memory request reaches the post-reserve high-water
+        // admission below; a speed request plans the active graph exactly.
+        if (!low_memory_request)
+            execution_geometry_growth_reason =
+                num_edges <= static_cast<std::size_t>(
+                    execution_geometry_capacity_edges)
+                ? "existing capacity reused"
+                : "exact growth: speed profile plans the active graph exactly";
+        else
+            execution_geometry_growth_reason =
+                "capacity high-water pending post-reserve admission";
     } else if (num_edges <= static_cast<std::size_t>(
             execution_geometry_capacity_edges)) {
         execution_geometry_planned_capacity_edges = geometric_capacity;
@@ -3934,7 +3974,7 @@ void MACEKokkos<Precision>::set_edge_geometry_policy(std::string policy)
         return;
     if (requested != EdgeGeometryPolicy::unit_f32_radius_f64
         && harmonic_storage_policy == HarmonicStoragePolicy::y_only_direct)
-        set_harmonic_storage_policy("retained");
+        apply_harmonic_storage_policy("retained");
     factorized_execution_space.fence("Change compact edge geometry policy");
     invalidate_factorized_prepared_graph();
     edge_geometry_policy = requested;
@@ -3977,7 +4017,7 @@ void MACEKokkos<Precision>::set_low_memory(const bool enabled)
         low_memory_available = 0;
         low_memory_speed_estimate = 0;
         low_memory_selected_estimate = 0;
-        set_harmonic_storage_policy("retained");
+        apply_harmonic_storage_policy("retained");
         return;
     }
 
@@ -5317,6 +5357,13 @@ template <typename Precision>
 std::size_t MACEKokkos<Precision>::factorized_reverse_coupling_workspace_bytes() const
 {
     return factorized_coupling_workspace_bytes;
+}
+
+template <typename Precision>
+std::size_t MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes() const
+{
+    return (A1_blas_flatten_input.span()+A1_blas_flatten_output.span())
+        * sizeof(Precision);
 }
 
 template <typename Precision>

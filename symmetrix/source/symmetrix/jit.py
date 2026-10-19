@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
 
 
 CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CACHE"
+TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_TRUST_SHARED_CACHE"
 HOST_TARGET_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_TARGET"
 HOST_FLAGS_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FLAGS"
 HOST_FP_MODE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FP_MODE"
@@ -64,7 +65,7 @@ HIP_R1_EDGE_BLOCKS_PER_CU_ENVIRONMENT_VARIABLE = (
 )
 CACHE_SCHEMA = "symmetrix.jit.cache-key"
 MANIFEST_SCHEMA = "symmetrix.jit.artifact"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CUDA_BUILD_SCHEMA = "symmetrix.jit.cuda-build"
 CUDA_BUILD_VERSION = 1
 CUDA_MODULE_BUILD_SCHEMA = "symmetrix.jit.cuda-module-build"
@@ -141,6 +142,7 @@ _MANIFEST_FIELDS = {
 _KEY_INPUT_FIELDS = {
     "schema",
     "version",
+    "source_content_sha256",
     "source_sha256",
     "abi",
     "build",
@@ -275,10 +277,46 @@ class _CompilerAdapter:
 _COMPILER_ADAPTERS: dict[str, _CompilerAdapter] = {}
 
 
-def versioned_jit_artifact_name(name: str) -> str:
+def _source_content_digest(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+        raise ValueError("source_content_sha256 must be a SHA-256 digest")
+    return value
+
+
+def native_source_content_sha256(native_module: Any) -> str:
+    """Return the full source identity for the loaded native backend."""
+
+    query = getattr(native_module, "_backend_build_info", None)
+    if not callable(query):
+        raise JitError("the native extension does not report source build identity")
+    build_info = query()
+    if not isinstance(build_info, Mapping):
+        raise JitError("the native extension reported invalid source build identity")
+    try:
+        value = _source_content_digest(build_info.get("source_content_sha256"))
+        if value is None:
+            from .backend_loader import selected_backend
+
+            descriptor = selected_backend()
+            if descriptor is not None:
+                value = _source_content_digest(descriptor.get("source_content_sha256"))
+    except ValueError as error:
+        raise JitError(str(error)) from error
+    if value is None:
+        raise JitError("the native extension has no source content fingerprint")
+    return value
+
+
+def versioned_jit_artifact_name(
+    name: str, source_content_sha256: str | None = None
+) -> str:
     """Return the cache artifact basename for the current generation."""
 
-    return f"{name}_gen{JIT_GENERATION_VERSION}"
+    source_digest = _source_content_digest(source_content_sha256)
+    source_suffix = "" if source_digest is None else f"_src{source_digest}"
+    return f"{name}_gen{JIT_GENERATION_VERSION}{source_suffix}"
 
 
 def _register_compiler_adapter(adapter: _CompilerAdapter) -> None:
@@ -321,19 +359,137 @@ def jit_cache_root(
     return Path.home() / ".cache" / "symmetrix" / "execution-jit"
 
 
-def _ensure_private_cache_root(path: Path) -> None:
-    """Create or validate the same-UID trust boundary for executable artifacts."""
+def _trust_shared_cache_root() -> bool:
+    """Report whether the caller accepted artifacts owned by another user."""
 
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink():
-        raise JitError("Execution JIT cache root must not be a symbolic link")
-    metadata = path.stat()
+    return os.environ.get(TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "") not in (
+        "",
+        "0",
+    )
+
+
+def _cache_root_metadata(path: Path) -> os.stat_result | None:
+    """Return resolved cache-root metadata, or None when the root is absent.
+
+    Symbolic links are followed, so the trust checks below apply to the
+    directory that actually stores the artifacts.
+    """
+
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return None
     if not stat.S_ISDIR(metadata.st_mode):
         raise JitError("Execution JIT cache root is not a directory")
+    return metadata
+
+
+def _artifacts_directory_metadata(path: Path) -> os.stat_result | None:
+    """Return resolved artifacts-directory metadata, or None when it is absent.
+
+    Symbolic links are followed, matching the cache-root rule, so a link to a
+    directory writable by other users is rejected like that directory itself.
+    """
+
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise JitError(
+            "Execution JIT artifacts path must be a private directory: it is not "
+            "a directory"
+        )
+    return metadata
+
+
+def _ensure_private_ancestors(path: Path) -> None:
+    """Reject ancestors another user could rename or replace.
+
+    Sticky ancestors such as ``/tmp`` are admitted: only the owner of an entry
+    may rename it there, so the resolved root cannot be swapped between manifest
+    validation and loading.
+    """
+
+    if os.name != "posix":
+        return
+    for ancestor in path.resolve().parents:
+        mode = stat.S_IMODE(ancestor.stat().st_mode)
+        if mode & 0o022 and not mode & 0o1000:
+            raise JitError(
+                f"Execution JIT cache ancestor {ancestor} is writable by other "
+                "users and is not sticky; cached artifacts could be replaced "
+                "before they are loaded"
+            )
+
+
+def _ensure_reusable_cache_root(path: Path) -> bool:
+    """Validate an existing cache root for artifact reuse.
+
+    Returns False when the root does not exist yet. Cached artifacts are
+    executable code, so a root or artifacts directory writable by other users
+    cannot be reused; reading them cannot be made safe by digest validation
+    alone. A root or artifacts directory owned by another user is reused only
+    when the caller opts in explicitly, since it means trusting code compiled by
+    that user. Ancestors of the resolved root must not be writable by others
+    unless they are sticky, because a writable ancestor could rename the root
+    away before it is loaded.
+    """
+
+    metadata = _cache_root_metadata(path)
+    if metadata is None:
+        return False
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise JitError(
+            "Execution JIT cache root must be private: it must not be writable "
+            "by other users"
+        )
+    if (
+        hasattr(os, "getuid")
+        and metadata.st_uid != os.getuid()
+        and not _trust_shared_cache_root()
+    ):
+        raise JitError(
+            "Execution JIT cache root is owned by another user; set "
+            f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
+            "artifacts from a shared cache"
+        )
+    artifacts = _artifacts_directory_metadata(path / "artifacts")
+    if artifacts is not None:
+        if os.name == "posix" and stat.S_IMODE(artifacts.st_mode) & 0o022:
+            raise JitError(
+                "Execution JIT artifacts directory must be private: it must not "
+                "be writable by other users"
+            )
+        if (
+            hasattr(os, "getuid")
+            and artifacts.st_uid != os.getuid()
+            and not _trust_shared_cache_root()
+        ):
+            raise JitError(
+                "Execution JIT artifacts directory is owned by another user; set "
+                f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
+                "artifacts from a shared cache"
+            )
+    _ensure_private_ancestors(path)
+    return True
+
+
+def _ensure_private_cache_root(path: Path) -> None:
+    """Create or validate the same-UID trust boundary for publishing artifacts."""
+
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = _cache_root_metadata(path)
+    if metadata is None:  # pragma: no cover - mkdir created the directory
+        raise JitError("Execution JIT cache root is unavailable")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise JitError("Execution JIT cache root must be owned by the current user")
-    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise JitError("Execution JIT cache root must be private; use permissions 0700")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise JitError(
+            "Execution JIT cache root must be private: it must not be writable "
+            "by other users"
+        )
+    _ensure_private_ancestors(path)
 
 
 def _json_value(value: Any, path: str = "value") -> Any:
@@ -970,6 +1126,7 @@ def detect_cpu_identity() -> dict[str, Any]:
 def _key_inputs(
     source: str,
     *,
+    source_content_sha256: str | None,
     abi: Any,
     build: Any,
     compiler: Any,
@@ -983,6 +1140,7 @@ def _key_inputs(
         {
             "schema": CACHE_SCHEMA,
             "version": SCHEMA_VERSION,
+            "source_content_sha256": _source_content_digest(source_content_sha256),
             "source_sha256": _sha256_bytes(source.encode("utf-8")),
             "abi": abi,
             "build": build,
@@ -999,6 +1157,7 @@ def _key_inputs(
 def jit_cache_key(
     source: str,
     *,
+    source_content_sha256: str | None = None,
     abi: Any,
     build: Any,
     compiler: Any,
@@ -1010,12 +1169,15 @@ def jit_cache_key(
 
     inputs = _key_inputs(
         source,
+        source_content_sha256=source_content_sha256,
         abi=abi,
         build=build,
         compiler=compiler,
         cpu=cpu,
         cxx_flags=cxx_flags,
-        artifact=_artifact_filename(versioned_jit_artifact_name(artifact_name)),
+        artifact=_artifact_filename(
+            versioned_jit_artifact_name(artifact_name, source_content_sha256)
+        ),
     )
     return _sha256_bytes(_canonical_json(inputs))
 
@@ -1685,6 +1847,7 @@ def remove_jit_quarantine(
 def _prepare_compiled_artifact(
     source: str,
     *,
+    source_content_sha256: str | None,
     abi: Any,
     configure,
     cache_root: str | os.PathLike[str] | None,
@@ -1708,11 +1871,12 @@ def _prepare_compiled_artifact(
         configuration: _CompileConfiguration = configure(diagnostics)
         compiler_command = configuration.command
         artifact_filename = _artifact_filename(
-            versioned_jit_artifact_name(artifact_name),
+            versioned_jit_artifact_name(artifact_name, source_content_sha256),
             configuration.artifact_suffix,
         )
         inputs = _key_inputs(
             source,
+            source_content_sha256=source_content_sha256,
             abi=abi,
             build=configuration.build,
             compiler=configuration.compiler,
@@ -1722,9 +1886,11 @@ def _prepare_compiled_artifact(
         )
         cache_key = _sha256_bytes(_canonical_json(inputs))
         root = jit_cache_root(cache_root)
-        _ensure_private_cache_root(root)
         entry, _, lock_path = _entry_paths(root, cache_key)
 
+        # Reuse only reads artifacts, so an existing shared root is admitted
+        # here; publishing below needs the same-UID trust boundary.
+        _ensure_reusable_cache_root(root)
         try:
             return _result_from_entry(
                 "cached", cache_key, entry, inputs, compiler_command, diagnostics
@@ -1733,6 +1899,7 @@ def _prepare_compiled_artifact(
             if entry.exists() or entry.is_symlink():
                 diagnostics.append(f"invalid cached JIT entry: {exc}")
 
+        _ensure_private_cache_root(root)
         (root / "artifacts").mkdir(parents=True, exist_ok=True, mode=0o700)
         staging_root = root / ".staging"
         staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2246,6 +2413,7 @@ def prepare_execution_compiler_artifact(
     *,
     abi: Any,
     request: CompilerRequest,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     artifact_name: str = "execution_gpu_artifact",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
@@ -2268,6 +2436,7 @@ def prepare_execution_compiler_artifact(
         )
     return _prepare_compiled_artifact(
         source,
+        source_content_sha256=source_content_sha256,
         abi=abi,
         configure=lambda diagnostics: adapter.configure(request, diagnostics),
         cache_root=cache_root,
@@ -2283,6 +2452,7 @@ def prepare_jit_artifact(
     *,
     abi: Any,
     build: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     cxx: str | os.PathLike[str] | Sequence[str] | None = None,
     cxx_flags: Sequence[str] | None = (),
@@ -2298,7 +2468,9 @@ def prepare_jit_artifact(
 
     The caller supplies the Symmetrix ABI and build identities because this
     standalone layer cannot infer the eventual plugin ABI.  It adds compiler,
-    CPU, source, and compile-option identities to the content key.
+    CPU, source, and compile-option identities to the content key. Production
+    native-backed callers should pass the loaded extension's full source
+    fingerprint; omission is retained for standalone compiler diagnostics.
     """
 
     def configure(diagnostics: list[str]) -> _CompileConfiguration:
@@ -2335,6 +2507,7 @@ def prepare_jit_artifact(
 
     return _prepare_compiled_artifact(
         source,
+        source_content_sha256=source_content_sha256,
         abi=abi,
         configure=configure,
         cache_root=cache_root,
@@ -2351,6 +2524,7 @@ def prepare_execution_cuda_jit_artifact(
     abi: Any,
     build: Any,
     compute_capability: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     nvcc: str | os.PathLike[str] | Sequence[str] | None = None,
     nvcc_flags: Sequence[str] = (),
@@ -2386,6 +2560,7 @@ def prepare_execution_cuda_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2400,6 +2575,7 @@ def prepare_execution_hip_jit_artifact(
     abi: Any,
     build: Any,
     target: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     hipcc: str | os.PathLike[str] | Sequence[str] | None = None,
     hipcc_flags: Sequence[str] = (),
@@ -2423,6 +2599,7 @@ def prepare_execution_hip_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2437,6 +2614,7 @@ def prepare_hiprtc_jit_artifact(
     abi: Any,
     build: Any,
     target: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     hiprtc_options: Sequence[str] = (),
     artifact_name: str = "factorized_hip_module",
@@ -2462,6 +2640,7 @@ def prepare_hiprtc_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2821,6 +3000,7 @@ def prepare_nvrtc_jit_artifact(
     abi: Any,
     build: Any,
     compute_capability: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     nvrtc_options: Sequence[str] = (),
     target: Any | None = None,
@@ -2855,6 +3035,7 @@ def prepare_nvrtc_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2875,13 +3056,13 @@ __all__ = [
     "HIP_R1_EDGE_THREADS_ENVIRONMENT_VARIABLE",
     "HOST_FLAGS_ENVIRONMENT_VARIABLE",
     "HOST_TARGET_ENVIRONMENT_VARIABLE",
+    "JIT_GENERATION_VERSION",
     "NVRTC_LIBRARY_ENVIRONMENT_VARIABLE",
     "CompilerRequest",
     "HostJitPolicy",
     "JitManifestError",
     "JitQuarantine",
     "JitResult",
-    "JIT_GENERATION_VERSION",
     "detect_cpu_identity",
     "execution_compiler_registry",
     "execution_cuda_jit_backend_request",
@@ -2892,6 +3073,7 @@ __all__ = [
     "jit_cache_root",
     "jit_hiprtc_information",
     "jit_nvrtc_information",
+    "native_source_content_sha256",
     "normalize_execution_hip_target_identity",
     "prepare_execution_compiler_artifact",
     "prepare_execution_cuda_jit_artifact",

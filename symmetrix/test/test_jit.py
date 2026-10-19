@@ -417,6 +417,7 @@ def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
     monkeypatch.setattr(jit, "_shared_library_suffix", lambda: ".so")
     common = {
         "source": _source(),
+        "source_content_sha256": "a" * 64,
         "abi": {"z": 2, "a": 1},
         "build": {"backend": "host"},
         "compiler": {"version": "test", "command": ["c++"]},
@@ -425,11 +426,12 @@ def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
     first = jit.jit_cache_key(**common)
     reordered = jit.jit_cache_key(**{**common, "abi": {"a": 1, "z": 2}})
     assert first == reordered
-    assert first == ("18053499c74e0e7f9a481bb581ca2bcd8b63be62631928a60c1968ee89d6a8ef")
+    assert first == ("84e81864ae64c36fd9aa859522dcc211d0f4fd5a6aabb17a50f6f671caa682a4")
     assert len(first) == 64
 
     variants = [
         {"source": _source(43)},
+        {"source_content_sha256": "b" * 64},
         {"abi": {"a": 1, "z": 3}},
         {"build": {"backend": "cuda"}},
         {"compiler": {"version": "other", "command": ["c++"]}},
@@ -916,6 +918,212 @@ def test_cache_rejects_group_writable_root(jit, tmp_path, cxx):
     assert not (cache / "artifacts").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_accepts_group_readable_root(jit, tmp_path, cxx):
+    cache = tmp_path / "readable-cache"
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o755)
+
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="readable-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert result.available
+    assert (cache / "artifacts").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_follows_symbolic_link_root(jit, tmp_path, cxx):
+    target = tmp_path / "resolved-cache"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "cache-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    first = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="symlink-root-test",
+        cpu="test-cpu",
+        cache_root=link,
+        cxx=cxx,
+    )
+    second = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="symlink-root-test",
+        cpu="test-cpu",
+        cache_root=link,
+        cxx=cxx,
+    )
+
+    assert first.available and first.status == "built"
+    assert second.available and second.cache_hit
+    assert (target / "artifacts").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_reuses_foreign_root_only_with_explicit_trust(
+    jit, monkeypatch, tmp_path, cxx
+):
+    cache = tmp_path / "site-cache"
+    prepared = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="trusted-shared-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert prepared.available and prepared.status == "built"
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    monkeypatch.delenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, raising=False)
+
+    refused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="trusted-shared-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert not refused.available
+    assert jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE in refused.reason
+
+    monkeypatch.setenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "1")
+    reused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="trusted-shared-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert reused.available and reused.cache_hit
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_rejects_group_writable_artifacts_directory(jit, tmp_path, cxx):
+    cache = tmp_path / "open-artifacts-cache"
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o755)
+    artifacts = cache / "artifacts"
+    artifacts.mkdir(mode=0o700)
+    artifacts.chmod(0o770)
+
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert not result.available
+    assert "artifacts" in result.reason
+    assert "private" in result.reason
+    assert list(artifacts.iterdir()) == []
+    assert not (cache / ".staging").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_requires_non_sticky_ancestors(jit, tmp_path, cxx):
+    # pytest's tmp_path sits below a sticky world-writable /tmp, where other
+    # users cannot rename an entry owned by this user; it must stay acceptable.
+    accepted = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="sticky-ancestor-test",
+        cpu="test-cpu",
+        cache_root=tmp_path / "sticky-cache",
+        cxx=cxx,
+    )
+    assert accepted.available
+
+    open_parent = tmp_path / "open-parent"
+    open_parent.mkdir(mode=0o700)
+    open_parent.chmod(0o777)
+    cache = open_parent / "cache"
+    cache.mkdir(mode=0o700)
+
+    refused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="ancestor-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert not refused.available
+    assert str(cache.resolve().parent) in refused.reason
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
+    jit, monkeypatch, tmp_path, cxx
+):
+    cache = tmp_path / "artifacts-owner-cache"
+    prepared = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-owner-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert prepared.available and prepared.status == "built"
+
+    # A root owned by the current user can still hold an artifacts directory
+    # owned by another user, so report only that path as foreign-owned; the
+    # existing foreign-root test cannot reach this branch because the root
+    # ownership check runs first.
+    artifacts = cache / "artifacts"
+    foreign_uid = os.getuid() + 1
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        metadata = real_stat(path, *args, **kwargs)
+        if Path(os.fspath(path)) == artifacts:
+            fields = list(metadata)
+            fields[4] = foreign_uid
+            return os.stat_result(fields)
+        return metadata
+
+    monkeypatch.setattr(jit.os, "stat", fake_stat)
+    monkeypatch.delenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, raising=False)
+
+    refused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-owner-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert not refused.available
+    assert "artifacts" in refused.reason
+    assert jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE in refused.reason
+
+    monkeypatch.setenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "1")
+    reused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-owner-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert reused.available and reused.cache_hit
+
+
 def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
     built = _prepare(jit, tmp_path, cxx)
     assert built.status == "built"
@@ -991,6 +1199,25 @@ def test_changed_source_publishes_a_distinct_entry(jit, tmp_path, cxx):
     assert first.available and second.available
     assert first.cache_key != second.cache_key
     assert first.artifact_path != second.artifact_path
+
+
+def test_changed_native_source_fingerprint_publishes_distinct_named_artifact(
+    jit, tmp_path, cxx
+):
+    first = _prepare(jit, tmp_path, cxx, source_content_sha256="a" * 64)
+    second = _prepare(jit, tmp_path, cxx, source_content_sha256="b" * 64)
+
+    assert first.available and second.available
+    assert first.cache_key != second.cache_key
+    assert first.artifact_path != second.artifact_path
+    assert first.artifact_path.name == (
+        f"execution_plugin_gen11_src{'a' * 64}{SHARED_SUFFIX}"
+    )
+    assert second.artifact_path.name == (
+        f"execution_plugin_gen11_src{'b' * 64}{SHARED_SUFFIX}"
+    )
+    assert first.manifest["key_inputs"]["source_content_sha256"] == "a" * 64
+    assert second.manifest["key_inputs"]["source_content_sha256"] == "b" * 64
 
 
 def test_invalid_cached_manifest_is_quarantined_and_rebuilt(jit, tmp_path, cxx):

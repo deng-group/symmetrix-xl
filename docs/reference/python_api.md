@@ -56,8 +56,8 @@ does not force the planner to select such a plan.
 `direct` is the first-class performance path. Two-interaction models require a
 matching admitted R1 artifact; admitted single-layer models run without R1
 specialization, although capacity planning may still compile or load M0/R0
-operator modules. `non-compiled` is an explicit compiler-free
-fallback/diagnostic mode with no performance guarantee. The `jit` argument is
+operator modules. `non-compiled` is an explicit compiler-free debug mode; it is
+not optimized and has no performance guarantee. The `jit` argument is
 deprecated and ignored;
 `SYMMETRIX_JIT_POLICY` controls required specialization or the explicit
 diagnostic-disabled policy.
@@ -74,10 +74,11 @@ Ordinary models implement `energy`, `free_energy`, `energies`, `forces`, and
 With a positive `neighbor_skin`, fully periodic `direct` Kokkos calculations
 construct and retain the candidate neighbor graph in native Kokkos memory.
 The ASE layer keeps only node-sized state for Verlet validity checks. Energy,
-forces, stress, polarization, and polarizability use this path; MACEField BECs
-currently retain host edge arrays for their response reduction. The diagnostic
-environment variable `SYMMETRIX_NEIGHBOR_BACKEND=host|kokkos` pins either
-implementation. On CUDA and HIP, the default `automatic` selects the host
+forces, stress, polarization, polarizability, and MACEField BECs use this path;
+host edge arrays are retained only by the legacy pair-derivative BEC reduction,
+which evaluators exposing the device-bins reduction no longer need. The
+diagnostic environment variable `SYMMETRIX_NEIGHBOR_BACKEND=host|kokkos` pins
+either implementation. On CUDA and HIP, the default `automatic` selects the host
 builder below 512 atoms and Kokkos at 512 atoms or above when native
 construction is eligible. Serial and OpenMP use the host builder by default.
 The calculator attribute `neighbor_graph_backend` reports the implementation

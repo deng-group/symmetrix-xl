@@ -212,7 +212,7 @@ std::unique_ptr<MACEKokkos<Precision>> load_mace_kokkos(
                 PyExc_UserWarning,
                 "Loaded the original Symmetrix pair-spline format (named v1 here); using "
                 "streamed_edges='materialized'. Re-export with radial_format='compact' "
-                "to enable streamed_edges='generic' execution.",
+                "to enable streamed_edges='non-compiled' execution.",
                 1) < 0)
             throw py::error_already_set();
     }
@@ -400,17 +400,37 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 return result;
             })
         .def("_set_m1_polynomial_policy",
-            &MACEKokkos<Precision>::set_m1_polynomial_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.m1_polynomial_policy_pinned = true;
+                self.set_m1_polynomial_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_m1_recompute_tile_channels",
             &MACEKokkos<Precision>::set_m1_recompute_tile_channels)
         .def("_set_m1_recompute_scratch_limit_for_testing",
             &MACEKokkos<Precision>::set_m1_recompute_scratch_limit_for_testing)
         .def("_set_mh0_state_policy",
-            &MACEKokkos<Precision>::set_mh0_state_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.mh0_state_policy_pinned = true;
+                self.set_mh0_state_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_edge_geometry_policy",
-            &MACEKokkos<Precision>::set_edge_geometry_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.edge_geometry_policy_pinned = true;
+                self.set_edge_geometry_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_harmonic_storage_policy",
-            &MACEKokkos<Precision>::set_harmonic_storage_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.harmonic_storage_policy_pinned = true;
+                self.set_harmonic_storage_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_low_memory_device_memory_info_for_testing",
             &MACEKokkos<Precision>::set_low_memory_device_memory_info_for_testing)
         .def("_set_single_layer_workspace_receiver_limit_for_testing",
@@ -428,7 +448,12 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         .def("_set_low_memory",
             &MACEKokkos<Precision>::set_low_memory)
         .def("_set_readout_policy",
-            &MACEKokkos<Precision>::set_readout_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.readout_policy_pinned = true;
+                self.set_readout_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_phi1_policy",
             &MACEKokkos<Precision>::set_phi1_policy)
         .def_property_readonly("m1_polynomial_policy",
@@ -690,6 +715,33 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 return self.macefield_response_a0_generic_launch_count;
             })
         .def_property_readonly(
+            "macefield_response_radial_inline_evaluation_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self
+                    .macefield_response_radial_inline_evaluation_count;
+            })
+        .def_property_readonly(
+            "macefield_response_radial_materialized_evaluation_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self
+                    .macefield_response_radial_materialized_evaluation_count;
+            })
+        .def_property_readonly(
+            "macefield_response_phi1r_slab_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.macefield_response_phi1r_slab_launch_count;
+            })
+        .def_property_readonly(
+            "macefield_response_phi1r_generic_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.macefield_response_phi1r_generic_launch_count;
+            })
+        .def_property_readonly(
+            "macefield_response_cg_table_build_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.macefield_response_cg_table_build_count;
+            })
+        .def_property_readonly(
             "streamed_edges_mode", &MACEKokkos<Precision>::streamed_edges_mode)
         .def_property_readonly(
             "supports_streamed_edges", &MACEKokkos<Precision>::supports_streamed_edges)
@@ -801,6 +853,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             [] (const MACEKokkos<Precision>& self) {
                 return self.factorized_workspace_capacity_bytes;
             })
+        .def_property_readonly("a1_blas_flatten_workspace_bytes",
+            &MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes)
         .def_property_readonly("factorized_schedule_build_count",
             [] (const MACEKokkos<Precision>& self) {
                 return self.factorized_schedule_build_count;
@@ -1796,14 +1850,17 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             [] (MACEKokkos<Precision>& self,
                     const std::uint64_t execution_graph_generation,
                     ContiguousDoubleArray electric_field,
-                    const bool include_force_derivative) {
+                    const bool include_force_derivative,
+                    const bool scatter_bec_bins) {
                 self.compute_prepared_factorized_field_response(
                     execution_graph_generation,
                     create_kokkos_view("electric_field", electric_field),
-                    include_force_derivative);
+                    include_force_derivative,
+                    scatter_bec_bins);
             },
             py::arg("execution_graph_generation"), py::arg("electric_field"),
-            py::arg("include_force_derivative"))
+            py::arg("include_force_derivative"),
+            py::arg("scatter_bec_bins") = false)
         .def_property_readonly("scalar_size_bytes", [] (const MACEKokkos<Precision>&) {
             return sizeof(Precision);
         })
@@ -2235,6 +2292,43 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     graph_generation);
             })
         // R0
+        .def("_compute_current_electric_field_bec_bins",
+            [] (MACEKokkos<Precision>& self,
+                    const int num_nodes,
+                    ContiguousIntArray node_types,
+                    ContiguousIntArray num_neigh,
+                    ContiguousIntArray neigh_indices,
+                    ContiguousIntArray neigh_types,
+                    ContiguousDoubleArray xyz,
+                    ContiguousDoubleArray r,
+                    ContiguousDoubleArray electric_field,
+                    std::uint64_t graph_generation) {
+                self.compute_current_electric_field_bec_bins(
+                    num_nodes,
+                    create_kokkos_view("node_types", node_types),
+                    create_kokkos_view("num_neigh", num_neigh),
+                    create_kokkos_view("neigh_indices", neigh_indices),
+                    create_kokkos_view("neigh_types", neigh_types),
+                    create_kokkos_view("xyz", xyz),
+                    create_kokkos_view("r", r),
+                    create_kokkos_view("electric_field", electric_field),
+                    graph_generation);
+            })
+        .def_property_readonly(
+            "electric_field_bec_bins",
+            [] (MACEKokkos<Precision>& self) {
+                auto host_bins = Kokkos::create_mirror_view_and_copy(
+                    Kokkos::HostSpace(), self.electric_field_bec_bins);
+                py::array_t<double, py::array::c_style> bins(
+                    {static_cast<py::ssize_t>(host_bins.extent(0)),
+                     static_cast<py::ssize_t>(host_bins.extent(1)),
+                     static_cast<py::ssize_t>(host_bins.extent(2))});
+                if (host_bins.span() != 0)
+                    std::memcpy(
+                        bins.mutable_data(), host_bins.data(),
+                        host_bins.span()*sizeof(double));
+                return bins;
+            })
         .def_property("R0",
             [] (MACEKokkos<Precision>& self) {
                 return view2vector(self.R0);

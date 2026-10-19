@@ -41,7 +41,7 @@ The supported public spellings are:
 | Request | Role |
 |---|---|
 | `direct` | Default prepared execution; two-interaction models require a matching R1 specialization, while admitted single-layer models use prepared R0/M0 execution without an R1 specialization. Capacity may still specialize their M0/R0 operators. |
-| `non-compiled` | Compiler-free compatibility and diagnostic path; no performance guarantee. |
+| `non-compiled` | Compiler-free debug path; not optimized and not a performance target. |
 | `materialized` | Original Symmetrix execution path, principally for the original Symmetrix model format (named v1 here) and retained numerical controls. |
 | `auto` | Temporary compatibility request resolved from model and evaluator capability. |
 
@@ -55,7 +55,7 @@ historical benchmark records that mention it describe an earlier
 implementation.
 
 The non-Kokkos evaluator selected with `use_kokkos=False` does not implement
-the prepared direct path: a `direct` request resolves to serial generic
+the prepared direct path: a `direct` request resolves to serial non-compiled
 execution with a warning, while an explicit `materialized` request remains
 materialized.
 
@@ -93,14 +93,23 @@ precision-, ABI-, generation-, and target-specific artifact:
 - LAMMPS loads prepared host or device artifacts and never invokes a compiler.
 
 Compilation or loading failure is fatal for direct execution. Set
-`SYMMETRIX_JIT_POLICY=none` only for diagnosis and select `non-compiled` when a
-compiler-free evaluation is intended.
+`SYMMETRIX_JIT_POLICY=none` only for diagnosis and select `non-compiled` only
+when a compiler-free debug evaluation is intended.
 
-Artifacts are stored below a private per-user cache. Set `SYMMETRIX_JIT_CACHE`
-before Python starts to choose an explicit location. The cache contains
-executable code and must not be writable by other users. Publication uses
-content-addressed entries and validates manifests, target identity, file size,
-and SHA-256 digests before reuse.
+Artifacts are stored below a per-user cache. Set `SYMMETRIX_JIT_CACHE` before
+Python starts to choose an explicit location. The cache contains executable
+code, so its root must not be writable by other users; group or other read
+access is allowed, and symbolic links are followed with the checks applied to
+the resolved target. An existing `artifacts/` child carries the same
+no-write-by-other-users rule. Every ancestor of the resolved root must likewise
+be non-writable by other users or carry the sticky bit (for example `/tmp`), so
+the root cannot be renamed or replaced before an artifact is loaded. Reusing a
+root owned by another user — for example a site-managed read-only artifact
+store — requires an explicit `SYMMETRIX_JIT_TRUST_SHARED_CACHE=1`, which accepts
+code compiled by that user. Compiling a missing artifact still requires a root
+owned by the current user.
+Publication uses content-addressed entries and validates manifests, target
+identity, file size, and SHA-256 digests before reuse.
 
 Concurrent cache misses compile in private staging directories. Publication
 prefers atomic no-replace rename; on filesystems that do not support it,
