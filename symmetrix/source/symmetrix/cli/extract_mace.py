@@ -16,8 +16,8 @@ def main(argv=None):
         "-z",
         nargs="+",
         help=(
-            "Optional restricted format-v2 or original Symmetrix pair-spline "
-            "element subset; omit for the preferred universal compact export."
+            "Optional restricted element subset; omit for the preferred universal "
+            "compact export."
         ),
         default=[],
     )
@@ -26,8 +26,8 @@ def main(argv=None):
         "-s",
         nargs="+",
         help=(
-            "Optional restricted format-v2 or original Symmetrix pair-spline "
-            "element subset; omit for the preferred universal compact export."
+            "Optional restricted element subset; omit for the preferred universal "
+            "compact export."
         ),
         default=[],
     )
@@ -43,14 +43,15 @@ def main(argv=None):
         default="compact",
         help=(
             "Radial representation. Compact supports universal artifacts; "
-            "pair-splines writes the original Symmetrix format (named v1 here)."
+            "pair-splines writes per-pair radial spline tables."
         ),
     )
     parser.add_argument(
         "--num-spline-points",
         type=int,
-        default=256,
-        help="Number of radial spline grid points.",
+        default=None,
+        help="Number of radial spline grid points (default 256). For MACE_Nonlinear "
+        "models this sets the runtime pair-spline table size.",
     )
     parser.add_argument("--output", "-o", help="Output filename.")
     parser.add_argument(

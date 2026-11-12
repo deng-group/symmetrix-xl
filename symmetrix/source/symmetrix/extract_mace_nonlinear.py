@@ -246,13 +246,17 @@ def _product(product) -> dict[str, Any]:
 
 
 def extract_mace_nonlinear_data(
-    model, atomic_numbers: list[int] | None = None
+    model,
+    atomic_numbers: list[int] | None = None,
+    num_spline_points: int | None = None,
 ) -> dict[str, Any]:
     """Return a full-domain versioned schema for nonlinear residual MACE models.
 
     ``atomic_numbers`` is retained as a compatibility argument for direct
     callers; a nonempty value is rejected because MH-1 parameters are defined
-    over the complete checkpoint species domain.
+    over the complete checkpoint species domain. ``num_spline_points``, when
+    given, is written to ``radial_embedding`` and sets the node count of the
+    runtime pair-spline table (the runtime default is 256).
     """
     from mace.modules.blocks import RealAgnosticResidualNonLinearInteractionBlock
 
@@ -338,7 +342,9 @@ def extract_mace_nonlinear_data(
             )
 
     output = {
-        "symmetrix_format_version": 3,
+        # Format 4 for every export; the nonlinear schema is unchanged from
+        # format 3 (linear_up stays a native layer, no inverse).
+        "symmetrix_format_version": 4,
         "model_type": "MACE_Nonlinear",
         "head": model.heads[0]
         if hasattr(model, "heads") and len(model.heads) == 1
@@ -377,6 +383,8 @@ def extract_mace_nonlinear_data(
         "readouts": [_readout(readout) for readout in model.readouts],
         "has_zbl": bool(getattr(model, "pair_repulsion", False)),
     }
+    if num_spline_points is not None:
+        output["radial_embedding"]["num_spline_points"] = int(num_spline_points)
     execution_contract = maybe_make_execution_mh1_contract(output)
     if execution_contract is not None:
         output["execution_contracts"] = {MH1_CONTRACT_KEY: execution_contract}

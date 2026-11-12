@@ -71,17 +71,27 @@ to 703.04 million atoms at 93.81% efficiency.
 
 ### Demonstrated speed
 
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
+A matched FP32 RTX 5090 qualification on November 4, 2026 compared complete
+warmed ASE energy/forces/stress calls for MACE-OMAT-0 medium. It used
+Symmetrix-XL 0.1.2 (`4f15f06`), MACE-Torch 0.3.17, cuEquivariance 0.11.1, and
+PyTorch 2.15.0+cu132, following the
+[paper-aligned comparison protocol](benchmarks/mace_torch_comparison_protocol.md):
 
-| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|
-| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
+| Implementation | Atoms | Median time (us/atom) | Sampled VRAM (MiB) | Matched speedup |
+|---|---:|---:|---:|---:|
+| MACE-Torch + cuEquivariance | 5,000 | 15.507 | 7,582 | 1.00x |
+| Symmetrix-XL direct | 5,000 | 1.922 | 1,282 | 8.07x |
 
-The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
-an effective cutoff of 6.5 A; the graph policies are therefore not identical.
+The checkpoint SHA-256 was
+`d4b14be9afa294eebdbe31a0280b26a0fa29715771e978cbfd3ca24e0d90307a`.
+Each value is the median of ten synchronized calls after three warmups on the
+same perturbed cubic SrTiO3 input. MACE-Torch used the exact 6.0 A graph with
+370,000 directed edges. Symmetrix-XL used the same model cutoff plus a 0.5 A
+neighbor-list skin, giving a 6.5 A effective cutoff and 511,962 directed edges;
+the graph policies are therefore not identical. Absolute Symmetrix-XL versus
+MACE-Torch differences were `2.64e-5 eV/atom` for energy, `9.16e-5 eV/A` for
+force components, and `1.34e-7 eV/A^3` for stress components. VRAM values are
+post-timing process samples rather than peak allocations.
 
 Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
 reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
@@ -222,14 +232,17 @@ symmetrix_extract_mace \
 ```
 
 The default is the preferred universal compact export, retaining every element
-supported by the checkpoint. Compact format v2 stores the shared radial model
-once instead of generating pair-specific spline tables, while format v3 also
-retains the complete checkpoint domain. Universal compact files therefore
-avoid quadratic pair-table growth and can be reused across compositions; they
-still include the checkpoint's element-indexed learned parameters. Element
-selectors are intended only for deliberately restricted format-v2 deployments
-or exports in the original Symmetrix pair-spline format (named v1 here);
-format-v3 models reject subsets.
+supported by the checkpoint. The compact radial representation stores the
+shared radial model once instead of generating pair-specific spline tables, and
+nonlinear MACE exports also retain the complete checkpoint domain. Universal
+compact files therefore avoid quadratic pair-table growth and can be reused
+across compositions; they still include the checkpoint's element-indexed
+learned parameters. Element selectors are intended only for deliberately
+restricted deployments or `--radial-format pair-splines` exports; nonlinear
+MACE models reject subsets. Exports use format version 4 (no inverse of
+`linear_up`); older format-1/2 JSON still loads, with a warning, and is
+converted with `symmetrix_recompose_mace_json --input old.json --output new.json`.
+Re-export to v4 is recommended but optional.
 
 CUDA and HIP backends are installed separately for a matching GPU architecture;
 see the [installation guide](docs/user/installation.md) and [Symmetrix-XL
