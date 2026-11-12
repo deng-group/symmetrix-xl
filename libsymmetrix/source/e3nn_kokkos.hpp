@@ -9,6 +9,11 @@
 #include "e3nn.hpp"
 #include "radial_function_set_kokkos.hpp"
 
+namespace symmetrix::execution::metal {
+class MetalTensorProductModule;
+class MetalViewRegistry;
+}
+
 template<typename Precision>
 class E3LinearKokkosT {
 public:
@@ -486,8 +491,34 @@ public:
         Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,
         Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint,
         Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint) const;
+    // Runs the direct-execution forward and reverse on the Apple GPU (FP32
+    // builds with the Metal layer only); views mapped in the registry are
+    // accessed in place. The members exist in every build so that the class
+    // layout does not depend on SYMMETRIX_ENABLE_METAL.
+    bool has_direct_execution_plan() const {
+        return static_cast<bool>(direct_execution_plan_);
+    }
+    void set_metal_execution(
+        std::shared_ptr<symmetrix::execution::metal::MetalTensorProductModule> module,
+        std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> views);
+    bool metal_execution_enabled() const { return static_cast<bool>(metal_module_); }
 private:
     std::shared_ptr<DirectExecutionPlan> direct_execution_plan_;
+    std::shared_ptr<symmetrix::execution::metal::MetalTensorProductModule> metal_module_;
+    std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> metal_views_;
+    void metal_forward(
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> weights,
+        Kokkos::View<Precision**,Kokkos::LayoutRight> output) const;
+    void metal_reverse(
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> weights,
+        Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+        Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,
+        Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint,
+        Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint) const;
 };
 
 using E3LinearKokkos = E3LinearKokkosT<double>;

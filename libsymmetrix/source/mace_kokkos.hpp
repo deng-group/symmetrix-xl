@@ -101,6 +101,7 @@ bool symmetrix_metal_supported();
 // Whether a Metal device usable by the Metal layer is present: a GPU with
 // the Metal 3 family and unified memory. Sets reason when it is not.
 bool symmetrix_metal_device_ready(std::string& reason);
+std::string symmetrix_metal_device_name();
 
 template <typename Precision>
 class MACEKokkos {

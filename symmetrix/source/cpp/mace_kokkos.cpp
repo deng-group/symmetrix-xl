@@ -3070,6 +3070,8 @@ void bind_mace_kokkos(py::module_ &m)
         const bool ready = symmetrix_metal_device_ready(reason);
         return py::make_tuple(ready, reason);
     }, "Return (ready, reason) for the Metal GPU used by metal=True.");
+    m.def("_metal_device_name", &symmetrix_metal_device_name,
+        "Return the name of the Metal GPU used by metal=True, or an empty string.");
     bind_mace_kokkos<double>(m, "MACEKokkos");
     bind_mace_kokkos<float>(m, "MACEKokkosFloat");
 }

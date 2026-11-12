@@ -47,7 +47,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_symmetrix_metal_sphericart_macros}")
 
 add_library(symmetrix_metal STATIC
-    metal_runtime.mm metal_m0_module.cpp metal_r0_module.cpp metal_r1_module.cpp)
+    metal_runtime.mm metal_m0_module.cpp metal_r0_module.cpp metal_r1_module.cpp
+    metal_tensor_product_module.cpp)
 target_include_directories(symmetrix_metal
     PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set_target_properties(symmetrix_metal PROPERTIES

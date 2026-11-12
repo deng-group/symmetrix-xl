@@ -72,6 +72,12 @@ print(atoms.get_forces()[:3])
 
 `Symmetrix(..., metal=True)` raises an error if the Metal layer is not available, so a run cannot fall back to the CPU silently. `calc.metal_stages` lists the stages that run on the GPU, for example `('R0', 'M0', 'R1', 'M1')`; any stage not listed runs on the CPU. `calc.metal_statistics()` reports per-stage GPU launch counts and times. Any ASE workflow works with this calculator, including molecular dynamics; the `metal=True` and `dtype="float32"` arguments are the only change from the CPU calculator.
 
+## MACE-POLAR-1
+
+`metal=True` also accepts MACE-POLAR-1 models (`MACE_Polar`) in FP32. The edge tensor products of the backbone, which take most of the CPU time, run on the GPU (`calc.metal_stages == ('TP',)`); the rest of the backbone, the Polar charge equilibration, and the electrostatics stay on one CPU core. The electrostatics are computed in FP64 on the host, as without Metal. `calc.metal_statistics()` reports the tensor-product launches and GPU time.
+
+On an M1 Max, for a 192-atom water box with MACE-POLAR-1-S (FP32, 6.0 A cutoff), one energy and force evaluation took 741 ms against 3,076 ms on the CPU for the periodic box (4.2 times faster) and 945 ms against 2,180 ms for the isolated cluster (2.3 times faster), whose real-space electrostatics remain on the CPU. Results agree with the FP32 CPU evaluator to rounding.
+
 ## Check the installation
 
 ```bash
@@ -89,7 +95,7 @@ Benchmarks on a laptop are sensitive to other GPU and CPU load. Animated wallpap
 ## Limitations
 
 - FP32 only.
-- Two-interaction standard MACE models only. `metal=True` rejects MACEField, MACE-MH-1 (`MACE_Nonlinear`), and single-layer models, which have not been qualified on the Metal stages; evaluate them on the CPU.
+- Two-interaction standard MACE models, and MACE-POLAR-1 with its backbone tensor products on the GPU. `metal=True` rejects MACEField, MACE-MH-1 (`MACE_Nonlinear`), and single-layer models, which have not been qualified on the Metal stages; evaluate them on the CPU.
 - Edge spherical harmonics up to `l_max` 3, the same limit as the generated `streamed_edges="direct"` path on the CPU and CUDA. This covers the MACE-MP-0, MP-0b3, OMAT-0, and OFF23 foundation models. `metal=True` rejects higher degrees, which run on the CPU with `streamed_edges="generic"`. The fastest R1 edge kernel needs a channel count that is a multiple of 32; other channel counts use a slower per-edge kernel.
 - No fixed-workspace tiled plans (`allow_fixed_workspace=True`), which are a CUDA capacity feature.
 - One process uses one GPU; there is no LAMMPS or MPI support for the Metal backend yet.

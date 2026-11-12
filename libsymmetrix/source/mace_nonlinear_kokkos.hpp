@@ -360,6 +360,15 @@ public:
     std::uint64_t factorized_graph_generation() const {
         return factorized_prepared_graph_generation;
     }
+    // Runs the direct-execution tensor products of every interaction on the
+    // Apple GPU (FP32 builds with the Metal layer). Returns the number of
+    // tensor products moved; the rest of the backbone stays on the host.
+    int load_metal_tensor_products();
+    bool metal_tensor_products_ready() const {
+        return static_cast<bool>(metal_tensor_products_);
+    }
+    // forward launches, reverse launches, GPU seconds, staging seconds
+    std::vector<double> metal_tensor_product_statistics() const;
     void validate_factorized_prepared_system(
         std::uint64_t graph_generation,std::span<const int> node_types,
         std::span<const double> cell,std::span<const int> pbc) const;
@@ -1150,6 +1159,10 @@ private:
         conditioned_mlp_workspace;
     E3LinearKokkosT<Precision> node_embedding;
     std::vector<Interaction> interactions;
+    std::shared_ptr<symmetrix::execution::metal::MetalTensorProductModule>
+        metal_tensor_products_;
+    std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry>
+        metal_tensor_product_views_;
     std::vector<E3ProductBasisKokkosT<Precision>> products;
     std::vector<Readout> readouts;
     std::vector<LayerState> states;

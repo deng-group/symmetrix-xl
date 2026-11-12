@@ -25,6 +25,10 @@
 #endif
 
 #include "affine_mlp.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_tensor_product_module.hpp"
+#include "metal_view_registry.hpp"
+#endif
 #include "device_backend.hpp"
 #include "jit_manifest_identity.hpp"
 #include "mace_device_backend.hpp"
@@ -10762,6 +10766,49 @@ void MaceBackboneKokkosT<Precision>::reduce_prepared_batched_stress(
                 reduced_stress(owner)=-value/device_volumes(graph);
             });
         });
+}
+
+template<typename Precision>
+int MaceBackboneKokkosT<Precision>::load_metal_tensor_products()
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr(std::is_same_v<Precision,float>) {
+        namespace metal=symmetrix::execution::metal;
+        auto views=std::make_shared<metal::MetalViewRegistry>(
+            metal::Device::system_default());
+        auto module=std::make_shared<metal::MetalTensorProductModule>();
+        module->set_host_memory(views->host_memory());
+        int loaded=0;
+        for(auto& interaction:interactions)
+            if(interaction.convolution.has_direct_execution_plan()) {
+                interaction.convolution.set_metal_execution(module,views);
+                ++loaded;
+            }
+        if(loaded==0)
+            throw std::logic_error(
+                "No tensor product of this model has a direct execution plan.");
+        metal_tensor_products_=std::move(module);
+        metal_tensor_product_views_=std::move(views);
+        return loaded;
+    }
+    throw std::invalid_argument("Metal tensor products require FP32.");
+#else
+    throw std::logic_error("Symmetrix was built without the Metal layer.");
+#endif
+}
+
+template<typename Precision>
+std::vector<double> MaceBackboneKokkosT<Precision>::metal_tensor_product_statistics() const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if(metal_tensor_products_) {
+        const auto& statistics=metal_tensor_products_->statistics();
+        return {static_cast<double>(statistics.forward_launches),
+            static_cast<double>(statistics.reverse_launches),
+            statistics.gpu_seconds,statistics.staging_seconds};
+    }
+#endif
+    return {0.0,0.0,0.0,0.0};
 }
 
 template<typename Precision>

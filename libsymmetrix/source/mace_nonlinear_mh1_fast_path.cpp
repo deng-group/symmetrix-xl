@@ -10,6 +10,11 @@
 
 #include "tools_kokkos.hpp"
 
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_tensor_product_module.hpp"
+#include "metal_view_registry.hpp"
+#endif
+
 namespace {
 // Local mirror of the shared profiling region in e3nn_kokkos.cpp.  The family
 // owner keeps its own copy so the shared translation unit exports no helper.
@@ -396,6 +401,10 @@ bool E3TensorProductKokkosT<Precision>::try_evaluate_direct_execution(
     Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
 {
     if(!direct_execution_plan_||dynamic_weights.extent(1)==0) return false;
+    if(metal_module_) {
+        metal_forward(input_1,input_2,dynamic_weights,output);
+        return true;
+    }
     ProfileRegion profile("symmetrix/mh1/tensor_product/forward");
     ordered_kokkos_deep_copy(output,Precision(0));
     auto mask=output_mask; auto fixed=internal_weights;
@@ -497,6 +506,11 @@ bool E3TensorProductKokkosT<Precision>::try_reverse_direct_execution(
     Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint) const
 {
     if(!direct_execution_plan_||dynamic_weights.extent(1)==0) return false;
+    if(metal_module_) {
+        metal_reverse(input_1,input_2,dynamic_weights,output_adjoint,
+            input_1_adjoint,input_2_adjoint,weights_adjoint);
+        return true;
+    }
     ProfileRegion profile("symmetrix/mh1/tensor_product/reverse");
     ordered_kokkos_deep_copy(input_1_adjoint,Precision(0));
     ordered_kokkos_deep_copy(input_2_adjoint,Precision(0));
@@ -1653,6 +1667,128 @@ try_reverse_execution_spline_uvu_from_nodes(
             });
     }
     return true;
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::set_metal_execution(
+    std::shared_ptr<symmetrix::execution::metal::MetalTensorProductModule> module,
+    std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> views)
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if(module) {
+        if constexpr(!std::is_same_v<Precision,float>)
+            throw std::invalid_argument("Metal tensor products require FP32.");
+        if(!direct_execution_plan_)
+            throw std::logic_error(
+                "Metal tensor products require a direct execution plan.");
+        if(!views)
+            throw std::invalid_argument(
+                "Metal tensor products require a view registry.");
+    }
+    metal_module_=std::move(module);
+    metal_views_=std::move(views);
+#else
+    if(module)
+        throw std::logic_error("Symmetrix was built without the Metal layer.");
+#endif
+}
+
+#ifdef SYMMETRIX_ENABLE_METAL
+namespace {
+
+template<class View>
+symmetrix::execution::metal::MetalTensorProductOperand metal_operand(const View& view)
+{
+    return {view.data(),static_cast<std::size_t>(view.stride(0)),view.span()};
+}
+
+template<class View>
+symmetrix::execution::metal::MetalTensorProductResult metal_result(const View& view)
+{
+    return {view.data(),static_cast<std::size_t>(view.stride(0)),view.span()};
+}
+
+template<class Plan,class Mask>
+symmetrix::execution::metal::MetalTensorProductPlan metal_plan(
+    const Plan& plan,const Mask& mask,const int input_2_dimension)
+{
+    symmetrix::execution::metal::MetalTensorProductPlan result;
+    result.instruction_data=plan.mh1_instruction_data.data();
+    result.instruction_count=static_cast<std::size_t>(plan.mh1_instruction_count);
+    result.instruction_stride=plan.mh1_instruction_data.extent(1);
+    result.path_weights=plan.mh1_path_weights.data();
+    result.sparse_indices=plan.mh1_sparse_indices.data();
+    result.sparse_count=plan.mh1_sparse_indices.extent(0);
+    result.sparse_stride=plan.mh1_sparse_indices.extent(1);
+    result.sparse_values=plan.mh1_sparse_values.data();
+    result.component_offsets=plan.mh1_component_offsets.data();
+    result.component_offset_count=plan.mh1_component_offsets.extent(0);
+    result.harmonic_offsets=plan.mh1_harmonic_offsets.data();
+    result.harmonic_terms=plan.mh1_harmonic_terms.data();
+    result.harmonic_term_count=plan.mh1_harmonic_terms.extent(0);
+    result.harmonic_term_stride=plan.mh1_harmonic_terms.extent(1);
+    result.harmonic_values=plan.mh1_harmonic_values.data();
+    result.output_mask=mask.data();
+    result.output_dimension=mask.extent(0);
+    result.input_2_dimension=static_cast<std::size_t>(input_2_dimension);
+    result.multiplicity=static_cast<std::uint32_t>(plan.mh1_multiplicity);
+    return result;
+}
+
+}  // namespace
+#endif
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::metal_forward(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> weights,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr(std::is_same_v<Precision,float>) {
+        ProfileRegion profile("symmetrix/mh1/tensor_product/forward_metal");
+        metal_views_->map(input_1);
+        metal_views_->map(input_2);
+        metal_views_->map(weights);
+        metal_views_->map(output);
+        metal_module_->forward(
+            metal_plan(*direct_execution_plan_,output_mask,input_2_dimension_),
+            input_1.extent(0),metal_operand(input_1),metal_operand(input_2),
+            metal_operand(weights),metal_result(output));
+        return;
+    }
+#endif
+    throw std::logic_error("Metal tensor product forward is unavailable.");
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::metal_reverse(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> weights,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint) const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr(std::is_same_v<Precision,float>) {
+        ProfileRegion profile("symmetrix/mh1/tensor_product/reverse_metal");
+        for(const auto& view:{input_1,input_2,weights,output_adjoint})
+            metal_views_->map(view);
+        for(const auto& view:{input_1_adjoint,input_2_adjoint,weights_adjoint})
+            metal_views_->map(view);
+        metal_module_->reverse(
+            metal_plan(*direct_execution_plan_,output_mask,input_2_dimension_),
+            input_1.extent(0),metal_operand(input_1),metal_operand(input_2),
+            metal_operand(weights),metal_operand(output_adjoint),
+            metal_result(input_1_adjoint),metal_result(input_2_adjoint),
+            metal_result(weights_adjoint));
+        return;
+    }
+#endif
+    throw std::logic_error("Metal tensor product reverse is unavailable.");
 }
 
 template class E3TensorProductKokkosT<float>;

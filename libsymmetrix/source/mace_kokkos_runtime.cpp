@@ -2364,6 +2364,15 @@ bool symmetrix_metal_device_ready(std::string& reason)
 #endif
 }
 
+std::string symmetrix_metal_device_name()
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    return symmetrix::execution::metal::metal_information().device_name;
+#else
+    return {};
+#endif
+}
+
 template <typename Precision>
 std::string MACEKokkos<Precision>::metal_r1_device_name() const
 {

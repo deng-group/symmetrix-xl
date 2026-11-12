@@ -349,3 +349,133 @@ def test_metal_r0_reverse_chunks_match_one_chunk(omat_small_model, tmp_path):
         )
         results[chunk] = np.load(output)
     np.testing.assert_allclose(results["1000"], results["0"], atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [(4, 2, 4, 2, []), (8, 4, 8, 2, [7, 9]), (12, 6, 16, 3, [9, 11, 7])],
+    ids=["c4-l2-linear", "c8-l2", "c12-l3"],
+)
+def test_metal_tensor_products_match_the_host_on_mh1_backbones(parameters, tmp_path):
+    available, reason = _metal_extension_available()
+    if not available:
+        pytest.skip(reason)
+    from test_mh1 import _generalized_mh1_atoms, _make_generalized_mh1
+
+    from symmetrix import Symmetrix
+
+    _, data = _make_generalized_mh1(parameters)
+    model = tmp_path / "mh1.json"
+    model.write_text(json.dumps(data, separators=(",", ":")))
+    host = Symmetrix(model, dtype="float32")
+    metal = Symmetrix(model, dtype="float32")
+    loaded = metal.evaluator._load_metal_tensor_products()
+    atoms = _generalized_mh1_atoms()
+
+    e_host, f_host, s_host = _evaluate(atoms, host)
+    e_metal, f_metal, s_metal = _evaluate(atoms, metal)
+
+    assert loaded >= 1
+    assert metal.evaluator._metal_tensor_products_ready()
+    forward, reverse, gpu_seconds, _ = (
+        metal.evaluator._metal_tensor_product_statistics()
+    )
+    assert forward >= 1 and reverse >= 1 and gpu_seconds > 0.0
+    # The kernels follow the host loops term by term.
+    np.testing.assert_allclose(e_metal, e_host, rtol=0.0, atol=1e-5)
+    np.testing.assert_allclose(f_metal, f_host, atol=1e-5)
+    np.testing.assert_allclose(s_metal, s_host, atol=1e-6)
+
+
+def _polar_model(tmp_path_factory):
+    checkpoint = os.environ.get("SYMMETRIX_POLAR_MODEL_S")
+    path = (
+        Path(checkpoint)
+        if checkpoint
+        else Path("~/.cache/symmetrix/test-models").expanduser()
+        / "MACE-POLAR-1-S.model"
+    )
+    if not path.is_file():
+        pytest.skip(
+            "the Metal Polar test needs the MACE-POLAR-1-S checkpoint "
+            f"(set SYMMETRIX_POLAR_MODEL_S, or cache it at {path})"
+        )
+    try:
+        import torch
+
+        from symmetrix.extract_mace_polar import extract_mace_polar_data
+
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float64)
+        try:
+            checkpoint_model = torch.load(
+                str(path), map_location="cpu", weights_only=False
+            )
+            data = extract_mace_polar_data(checkpoint_model.to(torch.float64))
+        finally:
+            torch.set_default_dtype(previous)
+    except ImportError as error:
+        pytest.skip(
+            f"extracting MACE-POLAR-1 requires torch and graph_longrange: {error}"
+        )
+    model = tmp_path_factory.mktemp("polar") / "MACE-POLAR-1-S.json"
+    model.write_text(json.dumps(data, separators=(",", ":")))
+    return model
+
+
+def _water_box(periodic):
+    from ase import Atoms
+    from ase.build import molecule
+
+    rng = np.random.default_rng(4)
+    atoms = Atoms()
+    for _ in range(8):
+        water = molecule("H2O")
+        water.rotate(rng.uniform(0, 360), "z")
+        water.translate(rng.uniform(0, 6, 3))
+        atoms += water
+    atoms.set_cell([7.0, 7.0, 7.0])
+    atoms.pbc = periodic
+    if periodic:
+        atoms.wrap()
+    else:
+        atoms.center(vacuum=5.0)
+    return atoms
+
+
+def test_metal_runs_mace_polar_tensor_products(tmp_path_factory):
+    available, reason = _metal_extension_available()
+    if not available:
+        pytest.skip(reason)
+    from symmetrix import Symmetrix
+
+    model = _polar_model(tmp_path_factory)
+    host = Symmetrix(model, dtype="float32")
+    metal = Symmetrix(model, dtype="float32", metal=True)
+
+    assert metal.metal_status == "ready"
+    assert metal.metal_stages == ("TP",)
+    assert metal.metal_device
+    for periodic in (True, False):
+        atoms = _water_box(periodic)
+        results = {}
+        for name, calc in (("host", host), ("metal", metal)):
+            image = atoms.copy()
+            image.calc = calc
+            results[name] = (
+                image.get_potential_energy(),
+                image.get_forces(),
+                image.get_stress() if periodic else np.zeros(6),
+                image.get_dipole_moment(),
+            )
+        (e_host, f_host, s_host, d_host) = results["host"]
+        (e_metal, f_metal, s_metal, d_metal) = results["metal"]
+        # FP32 summation order differs between the host loop and the GPU.
+        assert abs(e_metal - e_host) / len(atoms) < 1e-5
+        np.testing.assert_allclose(f_metal, f_host, atol=1e-4)
+        np.testing.assert_allclose(s_metal, s_host, atol=1e-6)
+        np.testing.assert_allclose(d_metal, d_host, atol=1e-5)
+    statistics = metal.metal_statistics()
+    assert statistics["tensor_product_forward_launches"] >= 2
+    assert statistics["tensor_product_reverse_launches"] >= 2
+    assert statistics["gpu_seconds"] > 0.0

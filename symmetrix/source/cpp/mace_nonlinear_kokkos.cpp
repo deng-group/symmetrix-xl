@@ -272,6 +272,12 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
             &Evaluator::load_jit_mh1_host_plugin_v6)
         .def("_load_jit_mh1_host_plugin_v7",
             &Evaluator::load_jit_mh1_host_plugin_v7)
+        .def("_load_metal_tensor_products",
+            &Evaluator::load_metal_tensor_products)
+        .def("_metal_tensor_products_ready",
+            &Evaluator::metal_tensor_products_ready)
+        .def("_metal_tensor_product_statistics",
+            &Evaluator::metal_tensor_product_statistics)
         .def_property_readonly(
             "jit_mh1_host_plugin_ready",
             &Evaluator::jit_mh1_host_plugin_ready)

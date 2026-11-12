@@ -1897,6 +1897,8 @@ class Symmetrix(Calculator):
             dtype=dtype,
             streamed_edges=self._native_streamed_edges,
         )
+        if self.metal_request and self._native_model_type == "MACE_Polar":
+            self._configure_metal_polar()
         if self.metal_request and self.metal_status != "ready":
             raise RuntimeError(
                 "metal=True requires generated direct R1 execution on a host "
@@ -2579,11 +2581,35 @@ class Symmetrix(Calculator):
         self.metal_status = "ready"
         self.metal_device = self.evaluator._metal_r1_device_name()
 
+    def _configure_metal_polar(self):
+        load = getattr(self.evaluator, "_load_metal_tensor_products", None)
+        if not callable(load):
+            raise RuntimeError(
+                "metal=True requires an evaluator with Metal tensor products"
+            )
+        load()
+        self.metal_stages = ("TP",)
+        self.metal_status = "ready"
+        self.metal_device = getattr(symmetrix, "_metal_device_name", lambda: "")()
+
     def metal_statistics(self):
-        """Return Metal R0/R1 launch counts and GPU/staging seconds."""
+        """Return Metal launch counts and GPU/staging seconds."""
 
         query = getattr(self.evaluator, "_metal_statistics", None)
-        return dict(query()) if callable(query) else {}
+        if callable(query):
+            return dict(query())
+        tensor_products = getattr(
+            self.evaluator, "_metal_tensor_product_statistics", None
+        )
+        if callable(tensor_products) and self.metal_status == "ready":
+            forward, reverse, gpu_seconds, staging_seconds = tensor_products()
+            return {
+                "tensor_product_forward_launches": int(forward),
+                "tensor_product_reverse_launches": int(reverse),
+                "gpu_seconds": gpu_seconds,
+                "staging_seconds": staging_seconds,
+            }
+        return {}
 
     def _configure_jit(
         self,
@@ -3694,6 +3720,10 @@ class Symmetrix(Calculator):
     def _require_metal_model_family(self):
         if not self.metal_request:
             return
+        if self._native_model_type == "MACE_Polar":
+            # The backbone's direct tensor products run on the Metal GPU; the
+            # Polar chain and electrostatics stay on the host.
+            return
         if self._native_model_type == "MACE" and not self._model_single_layer_readout:
             # Like the generated direct R1 path on the CPU and CUDA, the Metal
             # stages support edge harmonics up to l_max 3.
@@ -3713,8 +3743,8 @@ class Symmetrix(Calculator):
             else self._native_model_type
         )
         raise ValueError(
-            "metal=True supports two-interaction standard MACE models; "
-            f"{family} is not qualified on the Metal backend. Leave metal unset "
+            "metal=True supports two-interaction standard MACE and MACE-POLAR-1 "
+            f"models; {family} is not qualified on the Metal backend. Leave metal unset "
             "to evaluate it on the CPU."
         )
 
