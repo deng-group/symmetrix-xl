@@ -882,9 +882,11 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                 if(current_edges<0||xyz.size()!=3*current_edges)
                     throw py::value_error(
                         "Segmented stress geometry is inconsistent.");
-                self.reduce_prepared_batched_stress(
+                self.reduce_segmented_stress(
                     std::span<const double>(volumes.data(),volumes.size()),
-                    self.factorized_graph_generation());
+                    std::span<const std::int64_t>(
+                        edge_offsets.data(),edge_offsets.size()),
+                    create_kokkos_view("MH-1 segmented stress xyz",xyz));
                 if(self.stress_tensor.size()!=9*volumes.size())
                     throw py::value_error(
                         "Segmented stress tensor extent is inconsistent.");

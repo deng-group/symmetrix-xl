@@ -10764,6 +10764,79 @@ void MaceBackboneKokkosT<Precision>::reduce_prepared_batched_stress(
         });
 }
 
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::reduce_segmented_stress(
+    const std::span<const double> volumes,
+    const std::span<const std::int64_t> edge_offsets,
+    Kokkos::View<const double*> xyz)
+{
+    const std::uint64_t generation=
+        factorized_completed_evaluation_graph_generation;
+    if(generation!=0
+        &&generation==factorized_prepared_graph_generation
+        &&generation==factorized_prepared_batch_graph_generation) {
+        reduce_prepared_batched_stress(volumes,generation);
+        return;
+    }
+    const std::size_t graph_count=volumes.size();
+    if(graph_count==0||edge_offsets.size()!=graph_count+1
+        ||edge_offsets.front()!=0||xyz.extent(0)%3!=0
+        ||edge_offsets.back()!=static_cast<std::int64_t>(xyz.extent(0)/3))
+        throw std::invalid_argument(
+            "MH-1 segmented stress inputs are inconsistent.");
+    for(std::size_t graph=0;graph<graph_count;++graph)
+        if(!std::isfinite(volumes[graph])||!(volumes[graph]>0.0)
+            ||edge_offsets[graph]>edge_offsets[graph+1])
+            throw std::invalid_argument(
+                "MH-1 segmented stress volumes or edge offsets are invalid.");
+    const std::size_t num_edges=xyz.extent(0)/3;
+    if(node_forces.extent(0)<3*num_edges)
+        throw std::invalid_argument(
+            "MH-1 segmented stress reduction exceeds the evaluated edge extent.");
+
+    auto device_volumes=Kokkos::View<double*>(
+        Kokkos::view_alloc(
+            "MH-1 segmented stress volumes",Kokkos::WithoutInitializing),
+        graph_count);
+    auto offsets=Kokkos::View<std::int64_t*>(
+        Kokkos::view_alloc(
+            "MH-1 segmented stress offsets",Kokkos::WithoutInitializing),
+        graph_count+1);
+    Kokkos::deep_copy(factorized_execution_space,device_volumes,
+        Kokkos::View<const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            volumes.data(),volumes.size()));
+    Kokkos::deep_copy(factorized_execution_space,offsets,
+        Kokkos::View<const std::int64_t*,Kokkos::HostSpace,
+            Kokkos::MemoryUnmanaged>(edge_offsets.data(),edge_offsets.size()));
+    ensure_view(stress_tensor,stress_tensor_storage,9*graph_count);
+
+    const auto reduced_stress=stress_tensor;
+    const auto directed_forces=node_forces;
+    using team_policy=Kokkos::TeamPolicy<decltype(factorized_execution_space)>;
+    Kokkos::parallel_for(
+        "MaceNonlinearKokkos::reduce_segmented_stress",
+        team_policy(factorized_execution_space,
+            static_cast<int>(9*graph_count),Kokkos::AUTO),
+        KOKKOS_LAMBDA(const typename team_policy::member_type& team) {
+            const std::size_t owner=team.league_rank();
+            const std::size_t graph=owner/9;
+            const int component=owner%9;
+            const int force_component=component/3;
+            const int vector_component=component%3;
+            double value=0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::TeamThreadRange(team,offsets(graph),offsets(graph+1)),
+                [&](const std::int64_t edge,double& update) {
+                    const std::size_t index=static_cast<std::size_t>(edge);
+                    update+=directed_forces(3*index+force_component)
+                        *xyz(3*index+vector_component);
+                },value);
+            Kokkos::single(Kokkos::PerTeam(team),[&]() {
+                reduced_stress(owner)=-value/device_volumes(graph);
+            });
+        });
+}
+
 #else
 #error "SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART must select one implementation partition"
 #endif

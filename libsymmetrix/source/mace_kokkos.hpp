@@ -859,6 +859,13 @@ void prepare_factorized_batch(
 void reduce_prepared_batched_stress(
     std::span<const double> volumes,
     std::uint64_t graph_generation);
+// One stress tensor per edge segment of the last completed evaluation: the
+// prepared batch graph when it is that evaluation, otherwise the caller's
+// explicit edge geometry, whose rows follow the evaluated edges.
+void reduce_segmented_stress(
+    std::span<const double> volumes,
+    std::span<const std::int64_t> edge_offsets,
+    Kokkos::View<const double*> xyz);
 void reduce_prepared_all_interactions_stress(
     double volume,
     std::uint64_t graph_generation);

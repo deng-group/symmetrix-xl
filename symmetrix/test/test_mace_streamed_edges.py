@@ -1572,6 +1572,69 @@ def test_direct_prepared_batch_reduces_segmented_stress_on_device(
     np.testing.assert_allclose(reduced, expected, rtol=0.0, atol=3e-5)
 
 
+def test_direct_segmented_stress_without_a_prepared_batch_uses_explicit_geometry(
+    scalar_standard_model_path,
+):
+    # A joined graph evaluated without _prepare_factorized_batch (the plain
+    # joined-graph path) reduces the caller's edge geometry, as in
+    # Symmetrix-XL 0.1.x, even when an earlier graph had a prepared batch.
+    standard_path = scalar_standard_model_path
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator = Symmetrix(
+        standard_path,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
+    )
+    evaluator = calculator.evaluator
+    _load_direct_artifact(evaluator, standard_path, dtype="float32")
+    inputs = calculator._mace_inputs(atoms)
+    num_nodes, node_types, num_neigh, sources, neigh_types, xyz, distances, _ = inputs
+    edge_count = len(sources)
+
+    def joined(copies):
+        graph = (
+            copies * num_nodes,
+            np.tile(node_types, copies),
+            np.tile(num_neigh, copies),
+            np.concatenate(
+                [np.asarray(sources) + copy * num_nodes for copy in range(copies)]
+            ),
+            np.tile(neigh_types, copies),
+        )
+        offsets = np.arange(copies + 1, dtype=np.int64) * edge_count
+        return graph, offsets, np.tile(np.asarray(xyz).reshape(-1), copies)
+
+    stale_graph, stale_offsets, stale_xyz = joined(3)
+    stale = evaluator._prepare_factorized_graph(*stale_graph)
+    evaluator._prepare_factorized_batch(stale, stale_offsets)
+    evaluator._compute_prepared_factorized(stale, stale_xyz, np.tile(distances, 3))
+
+    graph, offsets, joined_xyz = joined(2)
+    token = evaluator._prepare_factorized_graph(*graph)
+    assert token != stale
+    evaluator._compute_prepared_factorized(token, joined_xyz, np.tile(distances, 2))
+    pair_forces = np.asarray(evaluator.node_forces, dtype=float).reshape(-1, 3)
+    # Doubled edge vectors show that the caller's geometry is reduced.
+    expected = np.stack(
+        (
+            -(pair_forces[:edge_count].T @ (2.0 * xyz)),
+            -(pair_forces[edge_count : 2 * edge_count].T @ (2.0 * xyz)),
+        )
+    )
+    reduced = np.asarray(
+        evaluator._reduce_segmented_stress(
+            np.ones(2, dtype=float), offsets, 2.0 * joined_xyz
+        ),
+        dtype=float,
+    ).reshape(2, 3, 3)
+    np.testing.assert_allclose(reduced, expected, rtol=0.0, atol=6e-5)
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        evaluator._reduce_segmented_stress(np.ones(2), offsets, joined_xyz[:-3])
+
+
 def test_factorized_compact_edge_geometry_reduces_stress_on_device(
     streamed_model_paths,
 ):

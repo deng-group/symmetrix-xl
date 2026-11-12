@@ -2463,9 +2463,11 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     || xyz.size() != 3*current_edges)
                     throw py::value_error(
                         "Segmented stress geometry is inconsistent.");
-                self.reduce_prepared_batched_stress(
+                self.reduce_segmented_stress(
                     std::span<const double>(volumes.data(), volumes.size()),
-                    self.factorized_completed_evaluation_graph_generation);
+                    std::span<const std::int64_t>(
+                        edge_offsets.data(), edge_offsets.size()),
+                    create_kokkos_view("segmented stress xyz", xyz));
                 return shaped_array(
                     view_prefix_1d(self.stress_tensor, 9*volumes.size()),
                     {volumes.size(), 3, 3});

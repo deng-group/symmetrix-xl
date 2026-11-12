@@ -3082,6 +3082,76 @@ def test_mh1_kokkos_disconnected_batch_stress_reduces_on_device(
         evaluator._reduce_batched_stress(volumes, batch_token)
 
 
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_mh1_segmented_stress_without_a_prepared_batch_uses_explicit_geometry(
+    generalized_mh1_artifact, dtype
+):
+    # Without a current prepared batch, the segmented reduction uses the
+    # caller's edge geometry, as in Symmetrix-XL 0.1.x.
+    evaluator_name = (
+        "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
+    )
+    if not hasattr(native_symmetrix, evaluator_name):
+        pytest.skip("Symmetrix was built without the requested Kokkos precision")
+    if dtype == "float64" and native_symmetrix._kokkos_default_execution_space() in (
+        "Cuda",
+        "HIP",
+    ):
+        pytest.skip("generated accelerator MH-1 direct execution requires FP32")
+    _, _, model_path = generalized_mh1_artifact
+    atoms = _generalized_mh1_atoms()
+    calculator = Symmetrix(
+        model_path,
+        dtype=dtype,
+        streamed_edges="direct",
+        execution_profile="speed",
+    )
+    evaluator = calculator.evaluator
+    evaluator.set_mh1_edge_executor("pair_spline_v1")
+    inputs = calculator._mace_inputs(atoms)
+    num_nodes, node_types, num_neigh, sources, neigh_types, xyz, distances, _ = inputs
+    edge_count = len(sources)
+
+    def joined(copies):
+        graph = (
+            copies * num_nodes,
+            np.tile(node_types, copies),
+            np.tile(num_neigh, copies),
+            np.concatenate(
+                [np.asarray(sources) + copy * num_nodes for copy in range(copies)]
+            ),
+            np.tile(neigh_types, copies),
+        )
+        offsets = np.arange(copies + 1, dtype=np.int64) * edge_count
+        return graph, offsets, np.tile(np.asarray(xyz).reshape(-1), copies)
+
+    # A batch prepared on an earlier, different graph must not be used.
+    stale_graph, stale_offsets, stale_xyz = joined(3)
+    stale = evaluator._prepare_factorized_graph(*stale_graph)
+    evaluator._prepare_factorized_batch(stale, stale_offsets)
+    evaluator._compute_prepared_factorized(stale, stale_xyz, np.tile(distances, 3))
+    graph, offsets, joined_xyz = joined(2)
+    token = evaluator._prepare_factorized_graph(*graph)
+    assert token != stale
+    evaluator._compute_prepared_factorized(token, joined_xyz, np.tile(distances, 2))
+    volumes = np.asarray([atoms.get_volume(), 2.0 * atoms.get_volume()])
+
+    stresses = np.asarray(
+        evaluator._reduce_segmented_stress(volumes, offsets, 2.0 * joined_xyz),
+        dtype=float,
+    ).reshape(2, 3, 3)
+
+    pair_forces = np.asarray(evaluator.node_forces, dtype=float).reshape(-1, 3)
+    expected = np.stack(
+        (
+            -(pair_forces[:edge_count].T @ (2.0 * xyz)) / volumes[0],
+            -(pair_forces[edge_count : 2 * edge_count].T @ (2.0 * xyz)) / volumes[1],
+        )
+    )
+    tolerance = 4e-12 if dtype == "float64" else 4e-5
+    np.testing.assert_allclose(stresses, expected, rtol=0.0, atol=tolerance)
+
+
 @pytest.mark.parametrize(
     ("dtype", "mode"),
     [("float64", "generic"), ("float32", "generic"), ("float32", "direct")],
