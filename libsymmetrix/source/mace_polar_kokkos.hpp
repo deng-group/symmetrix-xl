@@ -127,6 +127,40 @@ struct PreparedDeviceEvaluationResult {
     PreparedEvaluationDiagnostics diagnostics;
 };
 
+// Several independent structures evaluated as one prepared joined graph.  The
+// prepared segment geometry gives every structure its own cell, so no edge
+// joins two structures.  The nodes of graph g are contiguous and precede those
+// of graph g+1.  edge_offsets delimit the edges of each graph in the prepared
+// graph and are read only for stress.  All graphs share one PBC pattern and
+// must resolve the same long-range solver as when evaluated alone; the
+// particle-mesh solver evaluates one structure per call.
+struct PreparedBatchEvaluationRequest {
+    std::uint64_t graph_generation=0;
+    std::span<const int> node_types;
+    std::span<const double> positions;
+    std::span<const double> cells;
+    std::span<const int> graph_pbc;
+    std::span<const int> node_graph_index;
+    std::span<const double> total_charge;
+    std::span<const double> total_spin;
+    std::span<const double> external_potential;
+    std::span<const std::int64_t> edge_offsets;
+    bool include_forces=false;
+    bool include_stress=false;
+    bool include_dipole=false;
+    execution::long_range::LongRangeSolverRequest solver_request=
+        execution::long_range::LongRangeSolverRequest::automatic;
+};
+
+struct PreparedBatchEvaluationResult {
+    std::vector<double> energies;   // [graphs]
+    std::vector<double> forces;     // [nodes, 3]
+    std::vector<double> stress;     // [graphs, 6], ASE Voigt order
+    std::vector<double> dipoles;    // [graphs, 3]
+    execution::long_range::LongRangeSolver resolved_solver=
+        execution::long_range::LongRangeSolver::unresolved;
+};
+
 } // namespace symmetrix::mace_polar
 
 // The PolarMACE family's public evaluator.  It is a sibling of the ordinary
@@ -158,6 +192,7 @@ class MacePolarKokkosT final : public MaceBackboneKokkosT<Precision> {
     std::size_t whole_model_transaction_count_=0;
     std::size_t whole_model_reverse_count_=0;
     std::size_t whole_model_failure_count_=0;
+    std::size_t whole_model_batch_count_=0;
 
     symmetrix::execution::long_range::LongRangeSolverCapabilities
     polar_solver_capabilities() const noexcept
@@ -262,6 +297,12 @@ public:
     symmetrix::mace_polar::PreparedDeviceEvaluationResult
     evaluate_prepared_device(
         const symmetrix::mace_polar::PreparedEvaluationRequest& request);
+    symmetrix::mace_polar::PreparedBatchEvaluationResult evaluate_prepared_batch(
+        const symmetrix::mace_polar::PreparedBatchEvaluationRequest& request);
+    std::size_t whole_model_batch_count() const
+    {
+        return whole_model_batch_count_;
+    }
     std::size_t whole_model_transaction_count() const
     {
         return whole_model_transaction_count_;
@@ -864,6 +905,206 @@ MacePolarKokkosT<Precision>::evaluate_prepared_device(
         this->clear_layer_product_seed();
         result.diagnostics.product_seed_cleared=
             !this->has_layer_product_seed();
+        return result;
+    } catch(...) {
+        this->clear_layer_product_seed();
+        ++whole_model_failure_count_;
+        throw;
+    }
+}
+
+template<typename Precision>
+symmetrix::mace_polar::PreparedBatchEvaluationResult
+MacePolarKokkosT<Precision>::evaluate_prepared_batch(
+    const symmetrix::mace_polar::PreparedBatchEvaluationRequest& request)
+{
+    using namespace symmetrix::mace_polar;
+    using symmetrix::execution::long_range::LongRangeSolver;
+    using symmetrix::execution::long_range::LongRangeSolverRequest;
+    this->clear_layer_product_seed();
+    const std::size_t nodes=request.node_types.size();
+    const std::size_t graphs=request.total_charge.size();
+    if(request.graph_generation==0
+        ||request.graph_generation!=this->factorized_graph_generation())
+        throw std::invalid_argument(
+            "polar batch evaluation requires the current prepared graph "
+            "token.");
+    if(nodes==0||graphs==0
+        ||nodes>std::numeric_limits<std::size_t>::max()/3
+        ||request.positions.size()!=3*nodes
+        ||request.node_graph_index.size()!=nodes
+        ||request.cells.size()!=9*graphs
+        ||request.graph_pbc.size()!=3*graphs
+        ||request.total_spin.size()!=graphs
+        ||request.external_potential.size()!=4*graphs
+        ||(request.include_stress&&request.edge_offsets.size()!=graphs+1))
+        throw std::invalid_argument(
+            "polar batch request extents are inconsistent.");
+    std::vector<std::size_t> graph_nodes(graphs,0);
+    int previous_graph=0;
+    for(const int graph:request.node_graph_index) {
+        if(graph<previous_graph||graph>=static_cast<int>(graphs))
+            throw std::invalid_argument(
+                "polar batch node graph indices must be nondecreasing and "
+                "address the request's graphs.");
+        ++graph_nodes[static_cast<std::size_t>(graph)];
+        previous_graph=graph;
+    }
+    if(std::find(graph_nodes.begin(),graph_nodes.end(),std::size_t(0))
+        !=graph_nodes.end())
+        throw std::invalid_argument(
+            "every graph of a polar batch must contain at least one node.");
+    const auto finite=[](const double value) {return std::isfinite(value);};
+    if(!std::all_of(request.positions.begin(),request.positions.end(),finite)
+        ||!std::all_of(request.cells.begin(),request.cells.end(),finite)
+        ||!std::all_of(request.external_potential.begin(),
+            request.external_potential.end(),finite)
+        ||!std::all_of(request.total_charge.begin(),
+            request.total_charge.end(),finite)
+        ||!std::all_of(request.total_spin.begin(),
+            request.total_spin.end(),finite))
+        throw std::invalid_argument(
+            "polar batch request contains a non-finite input.");
+    for(std::size_t graph=1;graph<graphs;++graph)
+        if(!std::equal(request.graph_pbc.begin(),request.graph_pbc.begin()+3,
+                request.graph_pbc.begin()+3*graph))
+            throw std::invalid_argument(
+                "every graph of a polar batch must have the same PBC "
+                "pattern.");
+    if(request.solver_request==LongRangeSolverRequest::pme)
+        throw std::invalid_argument(
+            "the particle-mesh solver evaluates one polar structure per "
+            "call.");
+
+    auto& chain=this->polar_deltas();
+    ++whole_model_transaction_count_;
+    ++whole_model_batch_count_;
+    try {
+        this->set_retain_layer_features(true);
+        this->compute_prepared_factorized_positions(
+            request.graph_generation,request.positions);
+
+        typename PolarDeltaChainKokkosT<Precision>::Inputs inputs;
+        inputs.solver_request=request.solver_request;
+        const auto& retained=this->layer_features();
+        if(retained.size()!=static_cast<std::size_t>(
+                chain.interaction_count()))
+            throw std::invalid_argument(
+                "polar batch evaluation requires one retained backbone "
+                "feature view per interaction layer.");
+        inputs.node_feature_views.reserve(retained.size());
+        for(const auto& layer:retained)
+            inputs.node_feature_views.emplace_back(layer);
+        inputs.node_types.assign(
+            request.node_types.begin(),request.node_types.end());
+        inputs.positions.assign(
+            request.positions.begin(),request.positions.end());
+        inputs.cell.assign(request.cells.begin(),request.cells.end());
+        inputs.graph_pbc.assign(
+            request.graph_pbc.begin(),request.graph_pbc.end());
+        inputs.node_graph_index.assign(
+            request.node_graph_index.begin(),request.node_graph_index.end());
+        inputs.total_charge.assign(
+            request.total_charge.begin(),request.total_charge.end());
+        inputs.total_spin.assign(
+            request.total_spin.begin(),request.total_spin.end());
+        inputs.external_potential.assign(
+            request.external_potential.begin(),
+            request.external_potential.end());
+
+        const auto composed=chain.forward_composed_energy(
+            inputs,/*materialize_public_state=*/false,
+            /*materialize_outputs=*/false);
+        const LongRangeSolver resolved=chain.solver_decision().resolved;
+        if(resolved==LongRangeSolver::pme)
+            throw std::invalid_argument(
+                "the particle-mesh solver evaluates one polar structure per "
+                "call.");
+        const bool reverse=request.include_forces||request.include_stress;
+        if(reverse) {
+            const auto reverse_result=chain.reverse_composed_energy(
+                inputs,composed.state,
+                /*materialize_learned_adjoints=*/false,
+                /*materialize_input_adjoints=*/false);
+            (void)reverse_result;
+            Kokkos::View<const Precision**,Kokkos::LayoutRight> flat_seed=
+                chain.node_feature_seed();
+            this->set_layer_product_seed_flat(flat_seed);
+            ++whole_model_reverse_count_;
+            this->compute_prepared_factorized_positions(
+                request.graph_generation,request.positions);
+        }
+
+        PreparedBatchEvaluationResult result;
+        result.resolved_solver=resolved;
+        const auto polar_outputs=Kokkos::create_mirror_view_and_copy(
+            Kokkos::HostSpace(),chain.composed_graph_outputs_device());
+        const auto node_energies=Kokkos::create_mirror_view_and_copy(
+            Kokkos::HostSpace(),this->node_energies);
+        result.energies.assign(graphs,0.0);
+        for(std::size_t node=0;node<nodes;++node)
+            result.energies[static_cast<std::size_t>(
+                request.node_graph_index[node])]+=
+                static_cast<double>(node_energies(node));
+        for(std::size_t graph=0;graph<graphs;++graph)
+            result.energies[graph]+=polar_outputs(graph,0);
+        if(request.include_dipole) {
+            result.dipoles.resize(3*graphs);
+            for(std::size_t graph=0;graph<graphs;++graph)
+                for(int component=0;component<3;++component)
+                    result.dipoles[3*graph+component]=
+                        polar_outputs(graph,5+component);
+        }
+        if(request.include_forces) {
+            this->reduce_prepared_node_forces(request.graph_generation);
+            const auto forces=Kokkos::create_mirror_view_and_copy(
+                Kokkos::HostSpace(),this->atom_forces);
+            const auto polar_position=Kokkos::create_mirror_view_and_copy(
+                Kokkos::HostSpace(),chain.position_adjoint_device());
+            result.forces.resize(3*nodes);
+            for(std::size_t node=0;node<nodes;++node)
+                for(int component=0;component<3;++component)
+                    result.forces[3*node+component]=
+                        static_cast<double>(forces(3*node+component))
+                        -static_cast<double>(polar_position(node,component));
+        }
+        if(request.include_stress) {
+            result.stress.assign(6*graphs,0.0);
+            // Isolated structures report zero stress, as in evaluate_prepared.
+            if(resolved!=LongRangeSolver::realspace) {
+                std::vector<double> volumes(graphs);
+                for(std::size_t graph=0;graph<graphs;++graph) {
+                    const double* c=request.cells.data()+9*graph;
+                    volumes[graph]=std::abs(
+                        c[0]*(c[4]*c[8]-c[5]*c[7])
+                        -c[1]*(c[3]*c[8]-c[5]*c[6])
+                        +c[2]*(c[3]*c[7]-c[4]*c[6]));
+                }
+                this->prepare_factorized_batch(
+                    request.graph_generation,request.edge_offsets);
+                this->reduce_prepared_batched_stress(
+                    std::span<const double>(volumes.data(),volumes.size()),
+                    request.graph_generation);
+                const auto backbone=Kokkos::create_mirror_view_and_copy(
+                    Kokkos::HostSpace(),this->stress_tensor);
+                const auto polar_stress=Kokkos::create_mirror_view_and_copy(
+                    Kokkos::HostSpace(),chain.composed_stress_device());
+                for(std::size_t graph=0;graph<graphs;++graph) {
+                    const auto total=[&](const int index) {
+                        return static_cast<double>(backbone(9*graph+index))
+                            +polar_stress(graph,index);
+                    };
+                    double* voigt=result.stress.data()+6*graph;
+                    voigt[0]=total(0);
+                    voigt[1]=total(4);
+                    voigt[2]=total(8);
+                    voigt[3]=0.5*(total(5)+total(7));
+                    voigt[4]=0.5*(total(2)+total(6));
+                    voigt[5]=0.5*(total(1)+total(3));
+                }
+            }
+        }
+        this->clear_layer_product_seed();
         return result;
     } catch(...) {
         this->clear_layer_product_seed();

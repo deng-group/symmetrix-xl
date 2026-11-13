@@ -1032,6 +1032,13 @@ void bind_polar_delta_surface(py::class_<Evaluator>& cls)
             const std::vector<double>& total_spin,
             const ByteArray& external_potential,
             const std::string& polar_electrostatics) {
+            // The granular surfaces are single-system references; several
+            // structures are evaluated through _evaluate_polar_prepared_batch.
+            if (total_charge.size() != 1 || total_spin.size() != 1)
+                throw std::invalid_argument(
+                    "the granular polar program supports exactly one input "
+                    "system; batch structures with "
+                    "_evaluate_polar_prepared_batch.");
             Chain& chain = evaluator.polar_deltas();
             typename Chain::Inputs inputs;
             inputs.solver_request = execution::long_range::
@@ -1107,6 +1114,13 @@ void bind_polar_delta_surface(py::class_<Evaluator>& cls)
             const ByteArray& external_potential,
             const bool compute_reverse,
             const std::string& polar_electrostatics) {
+            // The granular surfaces are single-system references; several
+            // structures are evaluated through _evaluate_polar_prepared_batch.
+            if (total_charge.size() != 1 || total_spin.size() != 1)
+                throw std::invalid_argument(
+                    "the granular polar program supports exactly one input "
+                    "system; batch structures with "
+                    "_evaluate_polar_prepared_batch.");
             Chain& chain = evaluator.polar_deltas();
             typename Chain::Inputs inputs;
             inputs.solver_request = execution::long_range::
@@ -1326,6 +1340,71 @@ void bind_polar_delta_surface(py::class_<Evaluator>& cls)
         py::arg("pme_spline_order")=6,
         "Execute the complete prepared MACE Polar scientific transaction and "
         "return only public outputs plus compact execution diagnostics.");
+
+    cls.def("_evaluate_polar_prepared_batch",
+        [] (Evaluator& evaluator, const std::uint64_t graph_generation,
+            const IntArray& node_types, const ByteArray& positions,
+            const ByteArray& cells, const IntArray& graph_pbc,
+            const IntArray& node_graph_index, const ByteArray& total_charge,
+            const ByteArray& total_spin, const ByteArray& external_potential,
+            const py::array_t<std::int64_t,
+                py::array::c_style | py::array::forcecast>& edge_offsets,
+            const bool include_forces, const bool include_stress,
+            const bool include_dipole,
+            const std::string& polar_electrostatics) {
+            PreparedBatchEvaluationRequest request;
+            request.graph_generation=graph_generation;
+            request.node_types=std::span<const int>(
+                node_types.data(),node_types.size());
+            request.positions=std::span<const double>(
+                positions.data(),positions.size());
+            request.cells=std::span<const double>(cells.data(),cells.size());
+            request.graph_pbc=std::span<const int>(
+                graph_pbc.data(),graph_pbc.size());
+            request.node_graph_index=std::span<const int>(
+                node_graph_index.data(),node_graph_index.size());
+            request.total_charge=std::span<const double>(
+                total_charge.data(),total_charge.size());
+            request.total_spin=std::span<const double>(
+                total_spin.data(),total_spin.size());
+            request.external_potential=std::span<const double>(
+                external_potential.data(),external_potential.size());
+            request.edge_offsets=std::span<const std::int64_t>(
+                edge_offsets.data(),edge_offsets.size());
+            request.include_forces=include_forces;
+            request.include_stress=include_stress;
+            request.include_dipole=include_dipole;
+            request.solver_request=execution::long_range::
+                parse_long_range_solver_request(polar_electrostatics);
+            const auto evaluation=evaluator.evaluate_prepared_batch(request);
+            const int graphs=static_cast<int>(total_charge.size());
+            py::dict result;
+            result["energies"]=array_from_values_1d(evaluation.energies);
+            if(include_forces)
+                result["forces"]=array_from_values(
+                    evaluation.forces,static_cast<int>(node_types.size()),3);
+            if(include_stress)
+                result["stress"]=array_from_values(evaluation.stress,graphs,6);
+            if(include_dipole)
+                result["dipoles"]=array_from_values(
+                    evaluation.dipoles,graphs,3);
+            result["resolved_solver"]=std::string(
+                execution::long_range::to_string(evaluation.resolved_solver));
+            return result;
+        },
+        py::arg("graph_generation"),py::arg("node_types"),
+        py::arg("positions"),py::arg("cells"),py::arg("graph_pbc"),
+        py::arg("node_graph_index"),py::arg("total_charge"),
+        py::arg("total_spin"),py::arg("external_potential"),
+        py::arg("edge_offsets"),
+        py::arg("include_forces")=false,
+        py::arg("include_stress")=false,py::arg("include_dipole")=false,
+        py::arg("polar_electrostatics")="auto",
+        "Evaluate several structures of a prepared joined graph with "
+        "segment geometry in one MACE Polar transaction. Returns per-graph "
+        "energies, stresses, and dipoles and per-atom forces.");
+    cls.def_property_readonly("polar_whole_model_batch_count",
+        &Evaluator::whole_model_batch_count);
 
     cls.def_property_readonly("polar_whole_model_transaction_count",
         &Evaluator::whole_model_transaction_count);

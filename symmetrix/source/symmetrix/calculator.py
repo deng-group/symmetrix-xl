@@ -1826,8 +1826,7 @@ class Symmetrix(Calculator):
                 (canonical_streamed_edges == "auto" or streamed_edges_unset)
                 and bool(getattr(self.evaluator, "supports_factorized", False))
                 and self._default_execution_space_is_device()
-                and family_registry.routing_of(self._family_entry, "direct")
-                is not None
+                and family_registry.routing_of(self._family_entry, "direct") is not None
             )
             if device_direct:
                 selected_routing = "direct"
@@ -4334,6 +4333,76 @@ class Symmetrix(Calculator):
         """Return the complete polar stress produced by libsymmetrix."""
 
         return np.asarray(seeds["stress"], dtype=np.float64).reshape(-1, 3, 3)
+
+    _POLAR_BATCH_REFUSALS = (
+        "resolve different long-range solvers",
+        "particle-mesh solver evaluates one",
+    )
+
+    def calculate_polar_batch(self, structures, properties=("energy", "forces")):
+        """Evaluate independent MACE-POLAR-1 structures in shared native calls.
+
+        Returns one dictionary per structure with ``energy``, ``free_energy``,
+        and the requested ``forces``, ``stress``, and ``dipole``, equal to
+        :meth:`calculate` on each structure alone to rounding. Structures with
+        the same periodicity are evaluated in one native call, in which every
+        structure keeps its own cell, charge, spin, and field and resolves the
+        long-range solver it would resolve alone. A group whose structures
+        resolve different solvers, or the particle-mesh solver, is evaluated
+        one structure at a time. The calculator's own results are reset,
+        because a batch replaces the evaluator's prepared graph.
+        """
+
+        if self._native_model_type != "MACE_Polar":
+            raise ValueError("calculate_polar_batch requires a MACE_Polar model.")
+        adapter = self._family_frontend_adapter
+        structures = list(structures)
+        properties = list(dict.fromkeys(("energy", *properties)))
+        groups = {}
+        for index, atoms in enumerate(structures):
+            key = tuple(bool(value) for value in atoms.pbc)
+            groups.setdefault(key, []).append(index)
+        results = [None] * len(structures)
+        try:
+            for indices in groups.values():
+                members = [structures[index] for index in indices]
+                try:
+                    values = adapter.evaluate_batch(self, members, properties)
+                except ValueError as error:
+                    if not any(
+                        refusal in str(error) for refusal in self._POLAR_BATCH_REFUSALS
+                    ):
+                        raise
+                    values = [
+                        self._calculate_polar_alone(atoms, properties)
+                        for atoms in members
+                    ]
+                for index, value in zip(indices, values):
+                    results[index] = value
+        finally:
+            self._reset_after_polar_batch()
+        return results
+
+    def _calculate_polar_alone(self, atoms, properties):
+        self._reset_after_polar_batch()
+        self.calculate(atoms.copy(), properties, all_changes)
+        result = {}
+        for name in ("energy", "free_energy", "forces", "stress", "dipole"):
+            if name in self.results and (name in properties or name == "free_energy"):
+                value = self.results[name]
+                result[name] = (
+                    np.array(value, dtype=float, copy=True)
+                    if isinstance(value, np.ndarray)
+                    else float(value)
+                )
+        return result
+
+    def _reset_after_polar_batch(self):
+        # The batch prepared its own joined graph on the evaluator; the next
+        # single evaluation must prepare its graph again.
+        self.reset()
+        self._neighbor_cache = None
+        self._polar_graph_inputs = None
 
     def _polar_dipole_output(self):
         """Return the PolarMACE program's dipole output for this evaluation.

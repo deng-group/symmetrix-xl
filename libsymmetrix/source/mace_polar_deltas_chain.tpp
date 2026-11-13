@@ -1044,61 +1044,97 @@ void PolarDeltaChainKokkosT<Precision>::resolve_solver(
     automatic_reciprocal_modes_ = 0;
     automatic_reciprocal_modes_are_lower_bound_ = false;
 
-    if (graphs != 1) {
+    const auto reject = [&](const char* reason, std::string error) {
         solver_decision_ = LongRangeSolverDecision{};
         solver_decision_.requested = inputs.solver_request;
-        solver_decision_.reason = "single_system_required";
-        solver_decision_.error =
-            "POLAR electrostatics supports exactly one input system; mixed "
-            "or multi-system batches are unsupported.";
+        solver_decision_.reason = reason;
+        solver_decision_.error = std::move(error);
         release_reciprocal_state();
         throw std::invalid_argument(solver_decision_.error);
-    }
+    };
     if (graphs < 1
-        || inputs.graph_pbc.size() != static_cast<std::size_t>(graphs) * 3) {
-        solver_decision_ = LongRangeSolverDecision{};
-        solver_decision_.requested = inputs.solver_request;
-        solver_decision_.reason = "invalid_pbc_shape";
-        solver_decision_.error =
+        || inputs.graph_pbc.size() != static_cast<std::size_t>(graphs) * 3
+        || inputs.cell.size() != static_cast<std::size_t>(graphs) * 9)
+        reject("invalid_pbc_shape",
             "POLAR electrostatics routing requires one three-axis PBC row "
-            "per input graph.";
-        release_reciprocal_state();
-        throw std::invalid_argument(solver_decision_.error);
-    }
+            "and one cell per input graph.");
     const std::array<int, 3> pbc{
         inputs.graph_pbc[0], inputs.graph_pbc[1], inputs.graph_pbc[2]};
-    execution::long_range::LongRangeSolverCapabilities capabilities;
+    for (int graph = 1; graph < graphs; ++graph)
+        for (int axis = 0; axis < 3; ++axis)
+            if (inputs.graph_pbc[static_cast<std::size_t>(graph) * 3 + axis]
+                != pbc[static_cast<std::size_t>(axis)])
+                reject("mixed_pbc_batch",
+                    "a POLAR batch requires one PBC pattern for all graphs.");
+    execution::long_range::LongRangeSolverCapabilities base_capabilities;
 #if defined(SYMMETRIX_PARTICLE_MESH_AVAILABLE) && SYMMETRIX_PARTICLE_MESH_AVAILABLE
-    capabilities.pme_fft_provider_available = particle_mesh_workspace_ != nullptr;
+    base_capabilities.pme_fft_provider_available =
+        particle_mesh_workspace_ != nullptr;
 #if defined(KOKKOS_ENABLE_CUDA)
-    capabilities.pme_backend_qualified = particle_mesh_workspace_ != nullptr;
+    base_capabilities.pme_backend_qualified = particle_mesh_workspace_ != nullptr;
 #endif
 #endif
-    if (inputs.solver_request == LongRangeSolverRequest::automatic
-        && pbc == std::array<int, 3>{1, 1, 1}
-        && capabilities.pme_fft_provider_available
-        && capabilities.pme_backend_qualified
-        && inputs.cell.size() == 9) {
-        const execution::long_range::LongRangeConstTensor3<double> cell(
-            inputs.cell.data(), 1, 3, 3);
-        capabilities.automatic_nodes = static_cast<std::size_t>(nodes);
-        const std::size_t required_modes =
-            execution::long_range::automatic_pme_required_modes(
-                capabilities.automatic_nodes);
-        capabilities.automatic_reciprocal_modes =
-            ops_.reciprocal_mode_count_up_to(cell, required_modes);
-        automatic_nodes_ = capabilities.automatic_nodes;
-        automatic_reciprocal_modes_ =
-            capabilities.automatic_reciprocal_modes;
-        automatic_reciprocal_modes_are_lower_bound_ =
-            automatic_reciprocal_modes_ == required_modes;
+    std::vector<std::size_t> graph_nodes(static_cast<std::size_t>(graphs), 0);
+    if (graphs == 1)
+        graph_nodes[0] = static_cast<std::size_t>(nodes);
+    else
+        for (const int graph : inputs.node_graph_index)
+            ++graph_nodes[static_cast<std::size_t>(graph)];
+    // Each graph is resolved as if it were evaluated alone, so that a batch
+    // gives every structure the solver, and therefore the result, of an
+    // independent evaluation.
+    LongRangeSolverDecision first;
+    std::size_t first_nodes = 0, first_modes = 0;
+    bool first_lower_bound = false;
+    for (int graph = 0; graph < graphs; ++graph) {
+        auto capabilities = base_capabilities;
+        std::size_t modes = 0;
+        bool lower_bound = false;
+        if (inputs.solver_request == LongRangeSolverRequest::automatic
+            && pbc == std::array<int, 3>{1, 1, 1}
+            && capabilities.pme_fft_provider_available
+            && capabilities.pme_backend_qualified) {
+            const execution::long_range::LongRangeConstTensor3<double> cell(
+                inputs.cell.data() + static_cast<std::size_t>(graph) * 9,
+                1, 3, 3);
+            capabilities.automatic_nodes =
+                graph_nodes[static_cast<std::size_t>(graph)];
+            const std::size_t required_modes =
+                execution::long_range::automatic_pme_required_modes(
+                    capabilities.automatic_nodes);
+            capabilities.automatic_reciprocal_modes =
+                ops_.reciprocal_mode_count_up_to(cell, required_modes);
+            modes = capabilities.automatic_reciprocal_modes;
+            lower_bound = modes == required_modes;
+        }
+        auto decision = resolve_long_range_solver(
+            inputs.solver_request, pbc, contract_.long_range.density_max_l,
+            contract_.long_range.feature_max_l, capabilities);
+        if (!decision.accepted) {
+            solver_decision_ = decision;
+            release_reciprocal_state();
+            throw std::invalid_argument(solver_decision_.error);
+        }
+        if (graph == 0) {
+            first = decision;
+            first_nodes = capabilities.automatic_nodes;
+            first_modes = modes;
+            first_lower_bound = lower_bound;
+        } else if (decision.resolved != first.resolved) {
+            reject("mixed_solver_batch",
+                "the graphs of a POLAR batch resolve different long-range "
+                "solvers; evaluate them in separate batches.");
+        }
     }
-    solver_decision_ = resolve_long_range_solver(
-        inputs.solver_request, pbc, contract_.long_range.density_max_l,
-        contract_.long_range.feature_max_l, capabilities);
-    if (!solver_decision_.accepted) {
-        release_reciprocal_state();
-        throw std::invalid_argument(solver_decision_.error);
+    if (graphs > 1
+        && first.resolved == execution::long_range::LongRangeSolver::pme)
+        reject("pme_batch",
+            "the particle-mesh solver evaluates one POLAR structure per call.");
+    solver_decision_ = first;
+    if (graphs == 1) {
+        automatic_nodes_ = first_nodes;
+        automatic_reciprocal_modes_ = first_modes;
+        automatic_reciprocal_modes_are_lower_bound_ = first_lower_bound;
     }
 }
 

@@ -270,3 +270,163 @@ class MacePolarFrontendAdapter:
                 native_result["dipole"], dtype=float
             ).reshape(3)
         return results
+
+    @staticmethod
+    def _batch_topology(calculator, atoms):
+        """Return the neighbor topology of one batch member with lattice shifts.
+
+        Only edges inside the cutoff at the current positions are returned.
+        A single evaluation also passes the neighbor-skin shell, clamped to
+        the cutoff, where the radial functions of trained models vanish. For a
+        trajectory with an atombatch source, the calculator's Verlet cache
+        supplies the topology, which is rebuilt only when atoms move beyond the
+        neighbor skin; otherwise the neighbor list is built for this call and
+        the shifts are recovered from the edge vectors.
+        """
+
+        prepared = (
+            getattr(calculator.evaluator, "streamed_edges_mode", None) == "direct"
+        )
+        if prepared and atoms.info.get("atombatch_source") is not None:
+            calculator._mace_inputs(
+                atoms, native_geometry=True, allow_device_neighbor_graph=False
+            )
+            cache = calculator._neighbor_cache
+            if cache is not None and cache.device_graph_generation == 0:
+                # The Verlet topology includes a skin shell beyond the cutoff;
+                # only the edges inside the cutoff at the current positions are
+                # passed, which are the edges of an independent evaluation.
+                receivers = np.asarray(cache.receivers, dtype=np.int64)
+                sources = np.asarray(cache.sources, dtype=np.int64)
+                shifts = np.asarray(cache.shifts, dtype=np.int32).reshape(-1, 3)
+                positions = np.asarray(atoms.get_positions(), dtype=np.float64)
+                vectors = positions[sources] - positions[receivers]
+                if atoms.pbc.any():
+                    vectors += shifts @ np.asarray(atoms.cell.array, dtype=np.float64)
+                inside = np.einsum("ij,ij->i", vectors, vectors) < calculator.cutoff**2
+                return (
+                    len(atoms),
+                    np.asarray(cache.node_types, dtype=np.int32),
+                    np.bincount(receivers[inside], minlength=len(atoms)).astype(
+                        np.int32
+                    ),
+                    sources[inside],
+                    np.asarray(cache.neigh_types, dtype=np.int32)[inside],
+                    shifts[inside],
+                )
+        num_nodes, types, _, j, types_j, xyz, _, i = calculator._mace_inputs(atoms)
+        j = np.asarray(j, dtype=np.int64)
+        i = np.asarray(i, dtype=np.int64)
+        xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+        positions = np.asarray(atoms.get_positions(), dtype=np.float64)
+        if atoms.pbc.any():
+            cell = np.asarray(atoms.cell.array, dtype=np.float64)
+            translation = xyz - (positions[j] - positions[i])
+            shift = np.rint(translation @ np.linalg.inv(cell)).astype(np.int32)
+            vectors = positions[j] - positions[i] + shift @ cell
+        else:
+            shift = np.zeros((len(j), 3), dtype=np.int32)
+            vectors = positions[j] - positions[i]
+        inside = np.einsum("ij,ij->i", vectors, vectors) < calculator.cutoff**2
+        return (
+            num_nodes,
+            np.asarray(types, dtype=np.int32),
+            np.bincount(i[inside], minlength=num_nodes).astype(np.int32),
+            j[inside],
+            np.asarray(types_j, dtype=np.int32)[inside],
+            shift[inside],
+        )
+
+    @classmethod
+    def evaluate_batch(cls, calculator, structures, properties) -> list[dict]:
+        """Evaluate independent structures in one native transaction.
+
+        The structures form one joined graph whose segment geometry keeps each
+        structure in its own cell, so no edge joins two structures, and the
+        long-range program treats every structure as its own graph. All
+        structures must share one PBC pattern; the native call raises
+        ``ValueError`` when they would resolve different long-range solvers or
+        the particle-mesh solver. Returns one result dictionary per structure
+        with the properties of :meth:`evaluate`.
+        """
+
+        evaluator = calculator.evaluator
+        requested = set(properties)
+        node_types, num_neigh, j_list, neigh_types, shifts = [], [], [], [], []
+        positions, cells, segment_cells, pbcs, node_graphs = [], [], [], [], []
+        charge, spin, external, edge_offsets = [], [], [], [0]
+        offset = 0
+        for graph, atoms in enumerate(structures):
+            num_nodes, types, neighbors, j, types_j, shift = cls._batch_topology(
+                calculator, atoms
+            )
+            atom_positions = np.asarray(atoms.get_positions(), dtype=np.float64)
+            cell = np.asarray(atoms.cell.array, dtype=np.float64)
+            segment_cell = cell if atoms.pbc.any() else np.eye(3)
+            inputs = cls.resolve_graph_inputs(calculator, atoms)
+            field = np.asarray(inputs["electric_field"], dtype=np.float64).reshape(3)
+            node_types.append(np.asarray(types, dtype=np.int32))
+            num_neigh.append(np.asarray(neighbors, dtype=np.int32))
+            j_list.append((np.asarray(j, dtype=np.int64) + offset).astype(np.int32))
+            neigh_types.append(np.asarray(types_j, dtype=np.int32))
+            shifts.append(shift)
+            positions.append(atom_positions)
+            cells.append(cell.reshape(-1))
+            segment_cells.append(segment_cell.reshape(-1))
+            pbcs.append(np.asarray(atoms.pbc, dtype=np.int32))
+            node_graphs.append(np.full(num_nodes, graph, dtype=np.int32))
+            charge.append(float(inputs["total_charge"]))
+            spin.append(float(inputs["total_spin"]))
+            external.append((0.0, *field))
+            edge_offsets.append(edge_offsets[-1] + len(shift))
+            offset += num_nodes
+
+        all_types = np.concatenate(node_types)
+        all_positions = np.ascontiguousarray(np.concatenate(positions).reshape(-1))
+        offsets = np.asarray(edge_offsets, dtype=np.int64)
+        generation = evaluator._prepare_factorized_graph(
+            offset,
+            all_types,
+            np.concatenate(num_neigh),
+            np.concatenate(j_list),
+            np.concatenate(neigh_types),
+        )
+        evaluator._prepare_factorized_batch(generation, offsets)
+        evaluator._prepare_factorized_segment_geometry(
+            generation,
+            all_positions,
+            np.ascontiguousarray(np.concatenate(shifts).reshape(-1)),
+            np.concatenate(segment_cells),
+        )
+        native = evaluator._evaluate_polar_prepared_batch(
+            generation,
+            all_types,
+            all_positions,
+            np.concatenate(cells),
+            np.concatenate(pbcs),
+            np.concatenate(node_graphs),
+            np.asarray(charge, dtype=np.float64),
+            np.asarray(spin, dtype=np.float64),
+            np.asarray(external, dtype=np.float64).reshape(-1),
+            offsets,
+            include_forces=bool({"forces", "stress"} & requested),
+            include_stress="stress" in requested,
+            include_dipole="dipole" in requested,
+            polar_electrostatics=calculator.polar_electrostatics,
+        )
+        results = []
+        start = 0
+        for graph, atoms in enumerate(structures):
+            energy = float(native["energies"][graph])
+            result = {"energy": energy, "free_energy": energy}
+            if "forces" in requested:
+                result["forces"] = np.array(
+                    native["forces"][start : start + len(atoms)], dtype=float
+                )
+            if "stress" in requested:
+                result["stress"] = np.array(native["stress"][graph], dtype=float)
+            if "dipole" in requested:
+                result["dipole"] = np.array(native["dipoles"][graph], dtype=float)
+            results.append(result)
+            start += len(atoms)
+        return results
