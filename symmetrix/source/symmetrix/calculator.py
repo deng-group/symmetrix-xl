@@ -1817,11 +1817,24 @@ class Symmetrix(Calculator):
             # both routings. There is no mode to hand to the evaluator: the
             # routing selects whether the frontend loads its generated
             # subprogram, while the evaluator keeps its native portable plan.
-            selected_routing = (
-                "reference"
-                if canonical_streamed_edges == "auto" or streamed_edges_unset
-                else canonical_streamed_edges
+            # On a CUDA or HIP device the generated subprogram is the faster
+            # route (MACE-POLAR-1-S on an RTX 4090: 11.8 instead of 73.7 ms for
+            # 384 atoms), so an unset or automatic choice selects it there. On
+            # host execution spaces the generated host plugin is slower than
+            # the portable plan, which remains the default.
+            device_direct = (
+                (canonical_streamed_edges == "auto" or streamed_edges_unset)
+                and bool(getattr(self.evaluator, "supports_factorized", False))
+                and self._default_execution_space_is_device()
+                and family_registry.routing_of(self._family_entry, "direct")
+                is not None
             )
+            if device_direct:
+                selected_routing = "direct"
+            elif canonical_streamed_edges == "auto" or streamed_edges_unset:
+                selected_routing = "reference"
+            else:
+                selected_routing = canonical_streamed_edges
             routing = family_registry.routing_of(self._family_entry, selected_routing)
             if routing is None:
                 raise ValueError(
@@ -1831,7 +1844,15 @@ class Symmetrix(Calculator):
                     + ", ".join(route.key for route in self._family_entry.routings)
                     + "."
                 )
-            if canonical_streamed_edges == "auto" or streamed_edges_unset:
+            if device_direct:
+                self.streamed_edges_resolution_reason = (
+                    "the unset default selected direct because the family's "
+                    "generated subprogram runs on the device execution space"
+                    if streamed_edges_unset
+                    else "auto selected direct because the family's generated "
+                    "subprogram runs on the device execution space"
+                )
+            elif canonical_streamed_edges == "auto" or streamed_edges_unset:
                 self.streamed_edges_resolution_reason = (
                     "the unset default selected reference because the family "
                     "declares no streamed-edge mode handshake"
@@ -2610,6 +2631,30 @@ class Symmetrix(Calculator):
                 "staging_seconds": staging_seconds,
             }
         return {}
+
+    def _default_execution_space_is_device(self):
+        """Report whether the Kokkos default execution space is CUDA or HIP."""
+
+        execution_space_query = getattr(
+            symmetrix, "_kokkos_default_execution_space", None
+        )
+        execution_space = (
+            execution_space_query() if execution_space_query is not None else None
+        )
+        if execution_space in ("Cuda", "HIP"):
+            return True
+        if execution_space in _JIT_HOST_EXECUTION_SPACES:
+            return False
+        environment_query = getattr(
+            self.evaluator, "execution_device_execution_environment", None
+        )
+        environment = (
+            environment_query() if callable(environment_query) else environment_query
+        )
+        return isinstance(environment, dict) and environment.get("backend") in (
+            "cuda",
+            "hip",
+        )
 
     def _configure_jit(
         self,

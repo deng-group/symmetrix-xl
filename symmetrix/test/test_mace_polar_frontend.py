@@ -783,9 +783,11 @@ def test_direct_loads_generated_backbone_and_default_resolves_to_reference(
     """Direct generates the local backbone; reference stays compiler-free.
 
     The polar whole-program identity stays distinct from its generated MH-1
-    subprogram. The family still has no streamed-edge handshake, so the unset
-    default and ``auto`` resolve to reference, while an explicit direct request
-    selects the declared generated routing without handing a mode to native.
+    subprogram. The family still has no streamed-edge handshake, so on host
+    execution spaces the unset default and ``auto`` resolve to reference. On a
+    CUDA or HIP device they select the generated routing, which is faster
+    there. An explicit direct request selects the declared generated routing
+    without handing a mode to native.
     """
 
     unset = Symmetrix(
@@ -793,16 +795,25 @@ def test_direct_loads_generated_backbone_and_default_resolves_to_reference(
         dtype=dtype,
         polar_electrostatics="direct_reciprocal",
     )
-    assert unset.streamed_edges == "reference"
+    on_device = unset._default_execution_space_is_device()
     assert unset.streamed_edges_requested == "direct"
-    assert unset._native_streamed_edges == "materialized"
-    assert unset.jit_status == "not_applicable"
-    assert (
-        "the unset default selected reference because the family declares no "
-        "streamed-edge mode handshake"
-    ) == unset.streamed_edges_resolution_reason
     assert unset.evaluator.uses_mh1_fast_path
-    assert not unset.evaluator.jit_mh1_host_plugin_ready
+    if on_device:
+        assert unset.streamed_edges == "direct"
+        assert unset._native_streamed_edges == "direct"
+        assert (
+            "the unset default selected direct because the family's generated "
+            "subprogram runs on the device execution space"
+        ) == unset.streamed_edges_resolution_reason
+    else:
+        assert unset.streamed_edges == "reference"
+        assert unset._native_streamed_edges == "materialized"
+        assert unset.jit_status == "not_applicable"
+        assert (
+            "the unset default selected reference because the family declares "
+            "no streamed-edge mode handshake"
+        ) == unset.streamed_edges_resolution_reason
+        assert not unset.evaluator.jit_mh1_host_plugin_ready
 
     reference = Symmetrix(
         str(polar_model_path),
@@ -906,12 +917,19 @@ def test_direct_loads_generated_backbone_and_default_resolves_to_reference(
     assert direct.evaluator.factorized_fallback_evaluation_count == 0
 
     auto = Symmetrix(str(polar_model_path), dtype=dtype, streamed_edges="auto")
-    assert auto.streamed_edges == "reference"
-    assert auto._native_streamed_edges == "materialized"
-    assert auto.jit_status == "not_applicable"
     assert auto.evaluator.uses_mh1_fast_path
-    assert not auto.evaluator.jit_mh1_host_plugin_ready
-    assert "no streamed-edge mode handshake" in auto.streamed_edges_resolution_reason
+    if on_device:
+        assert auto.streamed_edges == "direct"
+        assert auto._native_streamed_edges == "direct"
+        assert "device execution space" in auto.streamed_edges_resolution_reason
+    else:
+        assert auto.streamed_edges == "reference"
+        assert auto._native_streamed_edges == "materialized"
+        assert auto.jit_status == "not_applicable"
+        assert not auto.evaluator.jit_mh1_host_plugin_ready
+        assert (
+            "no streamed-edge mode handshake" in auto.streamed_edges_resolution_reason
+        )
     assert auto.streamed_edges_resolution_reason != (
         unset.streamed_edges_resolution_reason
     )
