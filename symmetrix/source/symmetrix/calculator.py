@@ -4377,11 +4377,22 @@ class Symmetrix(Calculator):
                         self._calculate_polar_alone(atoms, properties)
                         for atoms in members
                     ]
+                else:
+                    self._add_polar_batch_corrections(members, values, properties)
                 for index, value in zip(indices, values):
                     results[index] = value
         finally:
             self._reset_after_polar_batch()
         return results
+
+    def _add_polar_batch_corrections(self, members, values, properties):
+        # The native batch evaluates the model only; corrections such as D3 are
+        # added per structure, as calculate() adds them to a single evaluation.
+        if not self._correction_pipeline:
+            return
+        additive = [name for name in properties if name in _FIELD_ADDITIVE_PROPERTIES]
+        for atoms, value in zip(members, values):
+            self._correction_pipeline.add_results(atoms, value, additive)
 
     def _calculate_polar_alone(self, atoms, properties):
         self._reset_after_polar_batch()

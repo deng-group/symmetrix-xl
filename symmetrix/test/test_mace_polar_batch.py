@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from ase import Atoms
 from symmetrix.calculator import Symmetrix
+from symmetrix.corrections import D3Correction
 from symmetrix.mace_polar_frontend import MacePolarFrontendAdapter
 from test_mace_polar_frontend import (  # noqa: F401 (pytest fixtures)
     polar_jit_cache,
@@ -137,6 +138,37 @@ def test_single_evaluation_after_batch_matches_fresh_calculator(polar_model_path
             np.testing.assert_allclose(
                 after[name], expected[name], rtol=0.0, atol=1e-12
             )
+
+
+def test_batch_adds_corrections_as_a_single_evaluation_does(polar_model_path):
+    calculator = Symmetrix(
+        str(polar_model_path), dtype="float64", corrections=[D3Correction()]
+    )
+    reference = Symmetrix(
+        str(polar_model_path),
+        dtype="float64",
+        corrections=[D3Correction()],
+        neighbor_skin=REFERENCE_SKIN,
+    )
+    uncorrected = Symmetrix(str(polar_model_path), dtype="float64")
+    structures = _structures()
+
+    results = calculator.calculate_polar_batch(structures, PROPERTIES)
+    bare = uncorrected.calculate_polar_batch(structures, PROPERTIES)
+
+    for atoms, result, model in zip(structures, results, bare):
+        expected = _single(reference, atoms, PROPERTIES)
+        assert result["energy"] == pytest.approx(
+            expected["energy"], abs=1e-10 * len(atoms), rel=0.0
+        )
+        assert result["free_energy"] == result["energy"]
+        for name in ("forces", "stress", "dipole"):
+            np.testing.assert_allclose(
+                result[name], expected[name], rtol=0.0, atol=1e-10
+            )
+        # D3 changes the energy and leaves the dipole to the model.
+        assert abs(result["energy"] - model["energy"]) > 1e-6
+        np.testing.assert_array_equal(result["dipole"], model["dipole"])
 
 
 def test_batch_returns_only_requested_properties(polar_model_path):
