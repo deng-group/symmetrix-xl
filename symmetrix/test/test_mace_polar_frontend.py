@@ -446,7 +446,7 @@ def test_quadrupole_features_admit_raw_program_but_refuse_composition(tmp_path, 
         if node_id.startswith("mh1.interaction")
     } == {"interaction0", "interaction1", "interaction2"}
     assert set(nodes) & LONG_RANGE_NODES == LONG_RANGE_NODES
-    with pytest.raises(RuntimeError, match="l<=2"):
+    with pytest.raises(RuntimeError, match="through l=2 only"):
         Symmetrix(str(path), dtype=dtype, streamed_edges="reference")
 
 
@@ -544,7 +544,7 @@ def test_polar_reference_retained_layout_rejects_odd_scalar_parity(tmp_path):
     for field in ("irreps_in", "irreps_out"):
         product["linear"][field] = "4x0o"
     path = _write_model(tmp_path / "odd-scalar-retained-layout.json", data)
-    with pytest.raises(RuntimeError, match="retained features support"):
+    with pytest.raises(RuntimeError, match="retained features require canonical bands"):
         _native_module().MACEPolarKokkos(str(path))
 
 
@@ -1151,6 +1151,47 @@ def test_polar_stress_diagnostics_are_explicit_and_preserve_public_results(
     np.testing.assert_array_equal(polar_stress, snapshot)
 
 
+def _packed_stress_reference(atoms, granular, diagnostic):
+    """Return the public stress composed from granular backbone and polar parts.
+
+    The backbone part is the virial of the backbone forces collected while the
+    chain's layer-product seed is installed, so it includes the cross term in
+    which positions change the retained products and the products change the
+    chain. ``_collect_mace_results`` reports the forces of that seeded reverse,
+    but its stress of an isolated structure does not contain their virial.
+    The polar part is the composition's complete stress.
+    """
+
+    from ase.stress import full_3x3_to_voigt_6_stress
+
+    forces = np.asarray(granular["forces"], dtype=np.float64)
+    virial = -(atoms.get_positions().T @ forces) / atoms.get_volume()
+    return full_3x3_to_voigt_6_stress(virial) + full_3x3_to_voigt_6_stress(
+        diagnostic["stress"][0]
+    )
+
+
+def _strain_derivative_stress(calculator, atoms, step=1e-5):
+    """Return (1/V) dE/d(strain) of the public energy by central differences."""
+
+    from ase.stress import full_3x3_to_voigt_6_stress
+
+    derivative = np.zeros((3, 3))
+    for row in range(3):
+        for column in range(3):
+            energies = []
+            for sign in (1.0, -1.0):
+                strain = np.eye(3)
+                strain[row, column] += sign * step / 2
+                strain[column, row] += sign * step / 2
+                strained = atoms.copy()
+                strained.set_cell(strained.cell.array @ strain, scale_atoms=True)
+                calculator.calculate(strained, properties=["energy"])
+                energies.append(float(calculator.results["energy"]))
+            derivative[row, column] = (energies[0] - energies[1]) / (2 * step)
+    return full_3x3_to_voigt_6_stress(derivative / atoms.get_volume())
+
+
 @pytest.mark.parametrize(("dtype", "atol"), (("float32", 3e-5), ("float64", 2e-11)))
 @pytest.mark.parametrize(
     ("include_forces", "include_stress"),
@@ -1159,11 +1200,14 @@ def test_polar_stress_diagnostics_are_explicit_and_preserve_public_results(
 def test_native_packed_outputs_match_granular_reference_and_own_their_lifetime(
     polar_model_path, dtype, atol, include_forces, include_stress
 ):
-    """The packed native boundary is the prior granular E/F/stress algebra.
+    """The packed native boundary is the granular E/F/stress algebra.
 
     A missing backbone or polar term, a wrong Voigt shear, or an array that
     aliases the evaluator's reusable pack makes this fail independently in
-    both native precisions.
+    both native precisions. The backbone stress is the virial of the seeded
+    backbone forces (see ``_packed_stress_reference``), and in FP64 the
+    packed stress is also checked against the strain derivative of the
+    public energy.
     """
 
     calculator = _polar_calculator(polar_model_path, dtype=dtype)
@@ -1193,8 +1237,6 @@ def test_native_packed_outputs_match_granular_reference_and_own_their_lifetime(
     finally:
         calculator.evaluator.clear_layer_product_seed()
 
-    from ase.stress import full_3x3_to_voigt_6_stress
-
     assert packed["energy"] == pytest.approx(
         granular["energy"] + diagnostic["energy"], abs=atol, rel=0.0
     )
@@ -1210,7 +1252,7 @@ def test_native_packed_outputs_match_granular_reference_and_own_their_lifetime(
     if include_stress:
         np.testing.assert_allclose(
             np.asarray(packed["stress"]).reshape(6),
-            granular["stress"] + full_3x3_to_voigt_6_stress(diagnostic["stress"][0]),
+            _packed_stress_reference(atoms, granular, diagnostic),
             rtol=0.0,
             atol=atol,
         )
@@ -1221,6 +1263,14 @@ def test_native_packed_outputs_match_granular_reference_and_own_their_lifetime(
     calculator.calculate(moved, properties=["energy", "forces", "stress"])
     for name, expected in snapshot.items():
         np.testing.assert_array_equal(packed[name], expected)
+
+    if include_stress and dtype == "float64":
+        np.testing.assert_allclose(
+            snapshot["stress"].reshape(6),
+            _strain_derivative_stress(calculator, atoms),
+            rtol=0.0,
+            atol=1e-7,
+        )
 
 
 @pytest.mark.parametrize("dtype", ("float32", "float64"))
@@ -1317,8 +1367,6 @@ def test_direct_native_packed_outputs_own_their_lifetime(
     finally:
         calculator.evaluator.clear_layer_product_seed()
 
-    from ase.stress import full_3x3_to_voigt_6_stress
-
     assert packed["energy"] == pytest.approx(
         granular["energy"] + diagnostic["energy"], abs=atol, rel=0.0
     )
@@ -1330,7 +1378,7 @@ def test_direct_native_packed_outputs_own_their_lifetime(
     )
     np.testing.assert_allclose(
         np.asarray(packed["stress"]).reshape(6),
-        granular["stress"] + full_3x3_to_voigt_6_stress(diagnostic["stress"][0]),
+        _packed_stress_reference(atoms, granular, diagnostic),
         rtol=0.0,
         atol=atol,
     )
@@ -1352,6 +1400,14 @@ def test_direct_native_packed_outputs_own_their_lifetime(
     calculator.calculate(moved, properties=["energy", "forces", "stress"])
     for name, expected in snapshot.items():
         np.testing.assert_array_equal(packed[name], expected)
+
+    if dtype == "float64":
+        np.testing.assert_allclose(
+            snapshot["stress"].reshape(6),
+            _strain_derivative_stress(calculator, atoms),
+            rtol=0.0,
+            atol=1e-7,
+        )
 
 
 @pytest.mark.parametrize("dtype", ("float32", "float64"))
