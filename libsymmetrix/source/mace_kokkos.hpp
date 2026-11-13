@@ -265,6 +265,11 @@ bool metal_r1_module_ready() const;
 // FP32 Metal execution of the standard R0 first interaction.
 void load_metal_r0_module();
 bool metal_r0_module_ready() const;
+// Whether a loaded Metal module serves the stage. The Metal R0 and M1 kernels
+// run inside the builtin implementations, so a generated host plugin for the
+// same stage is not selected while one is loaded.
+bool metal_r0_owns_dispatch() const;
+bool metal_m1_owns_dispatch() const;
 // FP32 Metal execution of the generated M0 product basis.
 void load_metal_m0_module(
     std::string source,

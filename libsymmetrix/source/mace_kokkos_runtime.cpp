@@ -1708,7 +1708,8 @@ void MACEKokkos<Precision>::load_m1_host_plugin(std::string path)
         m1_host_plugin =
             std::make_unique<symmetrix::execution::M0HostPlugin>(
                 std::move(loaded));
-        selected_m1_implementation = M1Implementation::host_plugin;
+        if (!metal_m1_owns_dispatch())
+            selected_m1_implementation = M1Implementation::host_plugin;
     }
 }
 
@@ -1956,7 +1957,8 @@ void MACEKokkos<Precision>::load_r0_host_plugin(
             std::make_unique<symmetrix::execution::R0HostPlugin>(
                 std::move(loaded));
         selected_r0_artifact_origin.clear();
-        selected_r0_implementation = R0Implementation::host_plugin;
+        if (!metal_r0_owns_dispatch())
+            selected_r0_implementation = R0Implementation::host_plugin;
     }
 }
 
@@ -2158,6 +2160,11 @@ void MACEKokkos<Precision>::load_metal_r0_module()
         metal_r0_module =
             std::make_shared<symmetrix::execution::metal::MetalR0Module>();
         metal_r0_module->set_host_memory(ensure_metal_views());
+        // The Metal R0 kernels run inside the builtin R0 path; a generated
+        // host plugin loaded earlier would otherwise take the stage.
+        if (selected_r0_implementation == R0Implementation::host_plugin)
+            selected_r0_implementation = standard_r0_module_ready
+                ? R0Implementation::builtin : R0Implementation::generic;
     }
 #else
     throw std::runtime_error(
@@ -2169,6 +2176,26 @@ template <typename Precision>
 bool MACEKokkos<Precision>::metal_r0_module_ready() const
 {
     return metal_module_ready_for_testing || static_cast<bool>(metal_r0_module);
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::metal_r0_owns_dispatch() const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>)
+        return static_cast<bool>(metal_r0_module);
+#endif
+    return false;
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::metal_m1_owns_dispatch() const
+{
+#ifdef SYMMETRIX_ENABLE_METAL
+    if constexpr (std::is_same_v<Precision, float>)
+        return static_cast<bool>(metal_m1_module);
+#endif
+    return false;
 }
 
 template <typename Precision>
@@ -2242,6 +2269,11 @@ void MACEKokkos<Precision>::load_metal_m1_module(
                 symmetrix::execution::metal::MetalM0Shape{
                     channels, input_components, output_components, term_count});
         metal_m1_module->set_host_memory(ensure_metal_views());
+        // The Metal M1 kernels run inside the builtin M1 path; a generated
+        // host plugin loaded earlier would otherwise take the stage.
+        if (selected_m1_implementation == M1Implementation::host_plugin)
+            selected_m1_implementation = standard_m1_module_ready
+                ? M1Implementation::builtin : M1Implementation::generic;
     }
 #else
     (void)source;
