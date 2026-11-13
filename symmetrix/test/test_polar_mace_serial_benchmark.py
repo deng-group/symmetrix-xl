@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ DRIVER = ROOT / "benchmarks/polar_mace_serial_benchmark.py"
 
 @pytest.fixture(scope="module")
 def benchmark_driver():
+    if not hasattr(os, "sched_setaffinity"):
+        pytest.skip("the benchmark driver pins its CPU at import (Linux only)")
     spec = importlib.util.spec_from_file_location(
         "polar_mace_serial_benchmark_test", DRIVER
     )

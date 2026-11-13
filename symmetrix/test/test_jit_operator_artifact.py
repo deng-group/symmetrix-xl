@@ -2,6 +2,7 @@ from types import SimpleNamespace
 import threading
 import json
 from pathlib import Path
+import platform
 
 import pytest
 from symmetrix import jit as jit_runtime
@@ -540,6 +541,10 @@ def test_host_m0_fallback_uses_one_native_policy_for_identity_and_manifest(
     )
 
 
+@pytest.mark.skipif(
+    platform.machine().lower() not in ("x86_64", "amd64"),
+    reason="compiles host R0 for the x86-64-v3 target",
+)
 def test_prepare_operator_modules_builds_architecture_specialized_host_r0(
     monkeypatch, tmp_path
 ):

@@ -58,7 +58,7 @@ def test_runner_compiles_r0_with_the_production_host_policy():
 def test_runner_requires_an_empty_task_specific_cache(runner, monkeypatch, tmp_path):
     for name in runner._THREAD_ENVIRONMENT:
         monkeypatch.setenv(name, "1")
-    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {7})
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {7}, raising=False)
     cache = tmp_path / "cache"
     cache.mkdir()
     (cache / "stale-artifact").write_text("stale")
@@ -70,7 +70,7 @@ def test_runner_requires_an_empty_task_specific_cache(runner, monkeypatch, tmp_p
 def test_reproducible_command_captures_affinity_threads_and_arguments(
     runner, monkeypatch
 ):
-    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {7})
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {7}, raising=False)
     for name in runner._THREAD_ENVIRONMENT:
         monkeypatch.setenv(name, "1")
     monkeypatch.setenv("OMP_PROC_BIND", "false")
@@ -93,7 +93,7 @@ def test_reproducible_command_captures_affinity_threads_and_arguments(
 def test_reproducible_command_and_provenance_capture_explicit_host_policy(
     runner, monkeypatch
 ):
-    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {7})
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {7}, raising=False)
     for name in runner._THREAD_ENVIRONMENT:
         monkeypatch.setenv(name, "1")
     policy_environment = {
